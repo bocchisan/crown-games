@@ -1,0 +1,36 @@
+[package]
+name = "conditional-tasks"
+version = "0.1.0"
+edition = "2021"
+description = "conditional-tasks — эталонная игра класса B (канистра ICP)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+candid = "0.10"
+serde = "1"             # #[serde]/Deserialize на candid-типах эндпоинтов
+ic-cdk = "0.20"
+conditional-tasks-logic = { path = "../logic" }
+crown-games-common = { path = "../../common" }  # общая деликатная крипта: пруф рождения (BLS), threshold-резолвер, PDA-адрес, кошельковая подпись
+sha2 = "0.10"            # task_id = sha256(поля области); хеши протокола
+bs58 = "0.5"            # bs58(task_id)/адресов в подписываемых сообщениях; encode резолвера
+hex = "0.4"             # hex(text_hash) в register-сообщении
+ic-cdk-management-canister = "0.1"  # schnorr_public_key: bootstrap мастер-ключа резолвера
+
+[build-dependencies]
+bs58 = "0.5"  # base58 → [u8;32] адресов (fee_wallet, factory) из config/ при сборке
+
+[dev-dependencies]
+ed25519-dalek = "2"       # SigningKey/Signer в тестах протокола и запроса
+pocket-ic = "13"          # BLS-цепочка против сертификата индекса; эндпоинт-харнесс с прокси
+candid = "0.10"
+bs58 = "0.5"              # валидный base58 task_id для NotDecided-пути request_signature
+# full-e2e (T5): мок SOL_RPC → index.ingest → пруф рождения → register → Signed.
+# (candid-типы getTransaction скопированы в тест, чтобы не линковать канистру индекса)
+crown-derive = { path = "../../../crown-factory/derive" }  # PDA эскроу (тот же, что индекс)
+solana-sdk = "2.3"        # Message/Transaction wire-формат для мок-tx
+bincode = "1"             # сериализация Transaction (как ждёт parse_message)
+sha2 = "0.10"             # anchor-дискриминатор create_escrow
+crown-salt = { path = "../../../crown-factory/salt" }  # two_outcome соль эскроу (адрес рождения)
+hex = "0.4"               # hex(cert/witness/text_hash) в register-запросе

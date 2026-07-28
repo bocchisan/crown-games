@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "canisters": {
+    "conditional-tasks": {
+      "type": "rust",
+      "package": "conditional-tasks",
+      "candid": "conditional-tasks.did"
+    }
+  }
+}

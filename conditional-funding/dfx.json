@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "canisters": {
+    "conditional-funding": {
+      "type": "rust",
+      "package": "conditional-funding",
+      "candid": "conditional-funding.did"
+    }
+  }
+}

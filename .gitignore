@@ -1,0 +1,6 @@
+# Build artifacts (all game subprojects: auction, subscription, conditional-*, common)
+target/
+.dfx/
+.anchor/
+test-ledger/
+node_modules/

@@ -1,0 +1,10 @@
+[package]
+name = "auction-logic"
+version = "0.1.0"
+edition = "2021"
+description = "auction: машина, финал (standing/beats/winner), голоса (zero-dep)"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"  # property-тест правила вердикта

@@ -1,0 +1,27 @@
+[package]
+name = "conditional-funding"
+version = "0.1.0"
+edition = "2021"
+description = "conditional-funding — краудфандинг-сбор (канистра ICP), форма two-outcome"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+candid = "0.10"
+serde = "1"
+ic-cdk = "0.20"
+conditional-funding-logic = { path = "../logic" }
+crown-games-common = { path = "../../common" }  # общая деликатная крипта: пруф рождения (BLS), threshold-резолвер, PDA-адрес, кошельковая подпись
+sha2 = "0.10"           # collection_id = sha256(поля области)
+bs58 = "0.5"            # encode резолвера/адресов
+hex = "0.4"             # hex(collection_id) в сообщениях
+ic-cdk-management-canister = "0.1"  # schnorr_public_key: bootstrap мастер-ключа резолвера
+
+[build-dependencies]
+bs58 = "0.5"  # base58 → [u8;32] адресов (fee_wallet, factory) из config/ при сборке
+
+[dev-dependencies]
+ed25519-dalek = "2"       # SigningKey/Signer в тестах протокола и состояния
+pocket-ic = "13"          # BLS-цепочка против реального сертификата индекса
+candid = "0.10"

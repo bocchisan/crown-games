@@ -1,0 +1,11 @@
+[package]
+name = "conditional-tasks-logic"
+version = "0.1.0"
+edition = "2021"
+description = "conditional-tasks: машина состояний + правило вердикта (zero-dep)"
+
+# zero-dep (dev: proptest для property-тестов вердикта).
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,96 @@
+// Outcome of an update — flat and typed.
+type AuctionResult = variant {
+  Advanced : AuctionStateView;
+  AuctionIdMismatch;
+  GrossBelowMinEntry;
+  Underpaid;
+  EntryNotFound;
+  DuplicateEscrow;
+  DurationOutOfRange;
+  Derived : record { auction : text };
+  VoteCapReached;
+  InvalidTransition;
+  NotFound;
+  NotBootstrapped;
+  VotingPeriodOutOfRange;
+  KeyBootstrapped;
+  EntryReturned;
+  AlreadyExists;
+  BadBirthProof;
+  TimeOverflow;
+  LotNotFound;
+  Malformed;
+  FieldMismatch;
+  NotDecided;
+  LotNotAccepted;
+  Materialized;
+  LotAlreadyAccepted;
+  SignFailed;
+  DuplicateVoter;
+  Signed : record { signature : blob; outcome : nat8 };
+  CreatedAtOverflow;
+  PerformWindowOutOfRange;
+  Registered;
+  WrongTarget;
+  DeadlineTooTight;
+  StepOverflow;
+  LotReturned;
+  WeightBelowThreshold;
+  NotRecipient;
+};
+// An auction's state, for `get_auction` / `Advanced`.
+type AuctionStateView = variant {
+  DoneSettle;
+  DoneNoWinner;
+  DoneCancel;
+  Bidding;
+  Voting;
+  Performing;
+};
+// Deploy-time overrides (testnet). Barred on mainnet.
+type InitArgs = record { nns_root_key : blob; index : principal };
+// A lot's public view.
+type LotView = record {
+  live_entries : nat64;
+  accepted : bool;
+  returned : bool;
+  text_hash : text;
+};
+service : (opt InitArgs) -> {
+  accept_lot : (text) -> (AuctionResult);
+  // One-time idempotent fetch of the threshold master public key.
+  bootstrap : () -> (AuctionResult);
+  cancel_auction : (text) -> (AuctionResult);
+  // Pure derivation echo (recipient-signed, zero writes, permissionless):
+  // recompute `auction_id` from the presented fields + config snapshot and confirm
+  // it matches the signed `auction`. Materialization happens later, on the first
+  // confirmed entry (`register_entry`).
+  create_auction : (text) -> (AuctionResult);
+  get_auction : (text) -> (opt AuctionStateView) query;
+  get_logic_version : () -> (nat32) query;
+  get_lot : (text, text) -> (opt LotView) query;
+  // The resolver a donor bakes into their escrow for entry `(lot, donor, nonce)`:
+  // `key([entry_id])`, `entry_id = sha256(lot ‖ donor ‖ nonce)`. Per-entry, so the
+  // verdict signed under it settles only this one escrow. Free, pure derivation.
+  get_resolver : (text, text, nat64) -> (opt text) query;
+  // The recipient names the winning lot (accepted, non-returned) → `Performing`.
+  pick_winner : (text) -> (AuctionResult);
+  ready : (text) -> (AuctionResult);
+  // Materialization carrier (donor-signed): verify the contribution's birth at the
+  // derived escrow, materialize the auction on the first confirmed entry, and add
+  // the entry to its lot.
+  register_entry : (text) -> (AuctionResult);
+  // Paid pull: the three-stage resolution → one signature under the escrow's own
+  // leaf scope (`key([entry_id])`). In `Bidding` (winner not yet picked) there is
+  // no verdict and no charge; `NoVerdict` (winner in `Performing`/`Voting`) also
+  // refuses without charge. Payment is accepted only when there is a verdict,
+  // before `sign_with_schnorr`.
+  request_signature : (text, text, text, text) -> (AuctionResult);
+  return_entry : (text) -> (AuctionResult);
+  return_lot : (text) -> (AuctionResult);
+  // A reputation-weighted vote on the winner lot (`Voting`). Validity (signature +
+  // weight proof ≥ `MIN_VOTE_WEIGHT`) is gated in `inspect_message` for free; here
+  // the weight is re-proven and recorded (dedup + `V_MAX` in the machine/state).
+  // Weight = the voter's reputation to the auction's recipient.
+  vote : (text) -> (AuctionResult);
+}

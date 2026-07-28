@@ -1,0 +1,17 @@
+# auction — devnet-профиль.
+crown_index   = "aaaaa-aa"                # principal crown-indexer
+threshold_key = "dfx_test_key"
+voting_period  = 120                       # devnet; в прообразе auction_id
+perform_window = 120
+min_entry      = 0                          # 0 = только флор формы
+sign_price     = 26_200_000_000            # цена подписи вклада (harness §5; ≤ релейного SIGN_PRICE)
+slot_ms        = 400                        # 1000/SLOTS_PER_SECOND (SLOTS_PER_SECOND=2.5)
+genesis_slot   = 0                          # якорь slot→unix (placeholder до A5 devnet)
+genesis_unix   = 0                          # якорь slot→unix (placeholder до A5 devnet)
+
+[[chain]]
+id         = "devnet"
+factory    = "PLACEHOLDER_factory_two_outcome"
+domain     = "crown:two-outcome:devnet"
+fee_bps    = 300
+fee_wallet = "PLACEHOLDER_fee_wallet"

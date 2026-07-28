@@ -1,0 +1,20 @@
+# Test fixture — a stand-in for the DFINITY SOL RPC canister
+# (`tghme-zyaaa-aaaar-qarca-cai`). The index calls its `getTransaction`; here we
+# return a pre-set reply (a real/synthetic `create_escrow` tx) so `ingest` records
+# a birth without a live outcall. Reuses the index's own candid types for an exact
+# match. Detached from the parent workspace via an empty `[workspace]`.
+[package]
+name = "mock-sol-rpc"
+version = "0.1.0"
+edition = "2021"
+description = "test fixture: a mock SOL RPC canister returning a preset getTransaction reply"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+candid = "0.10"
+ic-cdk = "0.20"
+crown-indexer = { path = "../../../../crown-indexer" }
+
+[workspace]

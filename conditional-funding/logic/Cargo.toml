@@ -1,0 +1,10 @@
+[package]
+name = "conditional-funding-logic"
+version = "0.1.0"
+edition = "2021"
+description = "conditional-funding: машина сбора + вердикт с кворумом (zero-dep)"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"

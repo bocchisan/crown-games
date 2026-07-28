@@ -1,0 +1,22 @@
+[package]
+name = "crown-games-common"
+version = "0.1.0"
+edition = "2021"
+description = "crown-games-common — общая деликатная крипта игр формы two-outcome (пруф рождения BLS, threshold-резолвер, PDA-адрес, кошельковая подпись)"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+crown-derive = { path = "../../crown-factory/derive" }  # адрес эскроу (PDA)
+crown-salt = { path = "../../crown-factory/salt" }       # соль формы two-outcome
+ed25519-dalek = "2"             # verify_strict кошельковых подписей
+bs58 = "0.5"                    # bs58 → [u8;N] в подписываемых сообщениях
+ic-certification = "3"          # HashTree.lookup/digest свидетеля рождения (пруф против корня индекса)
+ic-verify-bls-signature = "0.6" # BLS-проверка сертификата индекса против NNS root key (канистра слепа)
+serde_cbor = "0.11"             # CBOR-декод свидетеля/сертификата
+ic-ed25519 = { version = "0.6", default-features = false }  # threshold-деривация резолвера (точная схема IC; без rand/getrandom для wasm)
+
+[dev-dependencies]
+ic-certified-map = "0.4"  # форж дерева рождений (как в индексе) для теста пруфа
+ciborium = "0.2"          # сериализация свидетеля (как в индексе) для теста

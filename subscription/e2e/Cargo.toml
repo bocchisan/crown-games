@@ -1,0 +1,24 @@
+# subscription S1 — live devnet e2e for the `stream` form (create → release by
+# schedule → donor-signed cancel → permissionless refund). Standalone (empty
+# `[workspace]`) so it builds by manifest against the deployed devnet programs.
+[package]
+name = "subscription-e2e"
+version = "0.1.0"
+edition = "2021"
+description = "subscription S1: live devnet e2e for the stream form"
+
+[[bin]]
+name = "subscription-e2e"
+path = "src/main.rs"
+
+[dependencies]
+stream = { path = "../../../crown-factory/shapes/stream/solana", features = ["no-entrypoint"] }
+crown-salt = { path = "../../../crown-factory/salt" }
+crown-derive = { path = "../../../crown-factory/derive" }
+anchor-lang = "0.31.1"
+solana-sdk = "2.3"
+solana-client = "2.3"
+spl-token = "7"
+spl-associated-token-account = "6"
+
+[workspace]

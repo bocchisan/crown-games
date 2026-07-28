@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "canisters": {
+    "auction": {
+      "type": "rust",
+      "package": "auction",
+      "candid": "auction.did"
+    }
+  }
+}

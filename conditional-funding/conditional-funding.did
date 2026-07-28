@@ -1,0 +1,71 @@
+// Outcome of an update — flat and typed.
+type CollectionResult = variant {
+  Advanced : CollectionStateView;
+  Underpaid;
+  DurationOutOfRange;
+  // A `create` without a birth proof: derivation echo only, zero writes.
+  Derived : record { resolver : text; collection : text };
+  VoteCapReached;
+  CollectionIdMismatch;
+  InvalidTransition;
+  NotFound;
+  NotBootstrapped;
+  KeyBootstrapped;
+  AlreadyExists;
+  BadBirthProof;
+  TimeOverflow;
+  Malformed;
+  FieldMismatch;
+  NotDecided;
+  Materialized;
+  SignFailed;
+  DuplicateVoter;
+  // A verdict signature: `outcome` (settle=0/refund=1) + the schnorr signature.
+  Signed : record { signature : blob; outcome : nat8 };
+  CreatedAtOverflow;
+  WrongTarget;
+  DeadlineTooTight;
+  StepOverflow;
+  WeightBelowThreshold;
+  NotRecipient;
+};
+// A collection's state, for `get_collection` / `Advanced`.
+type CollectionStateView = variant {
+  DecidedSettle;
+  DecidedRefund;
+  Voting;
+  Funding;
+};
+// Deploy-time overrides (testnet): the index principal and the NNS root key
+// (PocketIC / a test IC differ from mainnet). Barred on mainnet.
+type InitArgs = record { nns_root_key : blob; index : principal };
+service : (opt InitArgs) -> {
+  // Fetch and cache the threshold master public key (one-time, idempotent). Must
+  // run after deploy before donors can query resolvers. `init` cannot (it is
+  // sync) and timers are barred, so this is an explicit setup call.
+  bootstrap : () -> (CollectionResult);
+  // Lazy creation (recipient-signed). Derive `collection_id` (recompute from the
+  // presented fields, match the signed `collection`) and its resolver. If a birth
+  // proof of the first funded contribution is attached, verify it at the derived
+  // escrow address and materialize the `Funding` collection, fixing `created_at`
+  // from the birth slot. Without a birth proof nothing is written (a derivation
+  // echo). `ready`/`recipient_cancel` never materialize.
+  create_collection : (text) -> (CollectionResult);
+  get_collection : (text) -> (opt CollectionStateView) query;
+  get_logic_version : () -> (nat32) query;
+  get_resolver : (text) -> (opt text) query;
+  ready : (text) -> (CollectionResult);
+  recipient_cancel : (text) -> (CollectionResult);
+  // Paid pull (fronted by the relay for `SIGN_PRICE`): the per-collection resolver
+  // signs the finalized verdict — **one** signature reused by all `N` escrows
+  // (they share `resolver = key([collection_id])`), which is the atomicity: a
+  // single `outcome` settles or refunds the whole collection, no Merkle root/path.
+  // Payment is accepted **before** `sign_with_schnorr`; a not-yet-`Decided`
+  // collection is refused without charge.
+  request_signature : (text, text) -> (CollectionResult);
+  // A reputation-weighted vote. Validity (signature + weight proof ≥
+  // `MIN_VOTE_WEIGHT`) is gated in `inspect_message` for free; here the weight is
+  // re-proven, the `(collection_id, voter)` dedup + `V_MAX` cap applied, and the
+  // vote recorded. Weight = the voter's reputation to the collection's recipient.
+  vote : (text) -> (CollectionResult);
+}

@@ -1,0 +1,4 @@
+# conditional-tasks — воркспейс: logic (zero-dep правила) + canister (ic-cdk).
+[workspace]
+members = ["logic", "canister"]
+resolver = "2"

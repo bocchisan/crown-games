@@ -1,0 +1,3 @@
+# E2e-драйвер devnet (S1): create_escrow → release(k) по расписанию
+# (permissionless) → cancel подписью донора / refund() по просрочке.
+# Использует форму stream (crown-factory) + crown-derive/crown-salt для адреса.

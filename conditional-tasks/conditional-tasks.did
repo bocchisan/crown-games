@@ -1,0 +1,83 @@
+// Deploy-time overrides (testnet): the index principal and the NNS root key
+// (PocketIC / a test IC differ from mainnet). Barred on mainnet.
+type InitArgs = record { nns_root_key : blob; index : principal };
+// A recipient profile, for `get_profile`.
+type ProfileView = record {
+  counter : nat64;
+  enabled : bool;
+  min_gross : nat64;
+  min_reputation : nat;
+};
+// Outcome of an update — flat and typed.
+type TaskResult = variant {
+  StaleCounter;
+  Advanced : TaskStateView;
+  Underpaid;
+  TaskIdMismatch;
+  ProfileMinBelowFloor;
+  ProfileDisabled;
+  DurationOutOfRange;
+  ReputationBelowMinimum;
+  VoteCapReached;
+  ProfileCapReached;
+  InvalidTransition;
+  NotFound;
+  NotBootstrapped;
+  KeyBootstrapped;
+  GrossBelowMinimum;
+  AlreadyExists;
+  BadBirthProof;
+  TimeOverflow;
+  Malformed;
+  FieldMismatch;
+  NotDecided;
+  Materialized;
+  GrossBelowFloor;
+  ProfileSet;
+  SignFailed;
+  DuplicateVoter;
+  // A verdict signature: `outcome` (settle=0/cancel=1) + the schnorr signature.
+  Signed : record { signature : blob; outcome : nat8 };
+  WrongTarget;
+  DeadlineTooTight;
+  StepOverflow;
+  WeightBelowThreshold;
+  NotRecipient;
+};
+// A task's state, for `get_task` / `Advanced`.
+type TaskStateView = variant {
+  DecidedSettle;
+  DecidedCancel;
+  Voting;
+  Accepted;
+  Created;
+};
+service : (opt InitArgs) -> {
+  accept : (text) -> (TaskResult);
+  // Fetch and cache the threshold master public key (one-time, idempotent). Must
+  // run after deploy before donors can query resolvers. `init` cannot (it is
+  // sync) and timers are barred, so this is an explicit setup call.
+  bootstrap : () -> (TaskResult);
+  decline : (text) -> (TaskResult);
+  get_logic_version : () -> (nat32) query;
+  get_profile : (text) -> (opt ProfileView) query;
+  get_resolver : (text) -> (opt text) query;
+  get_task : (text) -> (opt TaskStateView) query;
+  get_verdict : (text) -> (opt TaskStateView) query;
+  ready : (text) -> (TaskResult);
+  // Lazy creation: derive `task_id`, verify the birth proof at the derived escrow
+  // address, validate registration, and materialize the `Created` task. Without a
+  // valid birth proof nothing is written.
+  register_task : (text) -> (TaskResult);
+  // Paid pull (fronted by the relay for `SIGN_PRICE`): the per-scope resolver
+  // signs the finalized verdict. Payment is accepted **before** `sign_with_schnorr`;
+  // a not-yet-`Decided` task is refused without charge. One signature per scope,
+  // reused by its escrow's `claim(outcome, sig)`.
+  request_signature : (text, text) -> (TaskResult);
+  set_profile : (text) -> (TaskResult);
+  // A reputation-weighted vote. Validity (signature + weight proof ≥
+  // `MIN_VOTE_WEIGHT`) is gated in `inspect_message` for free; here the weight is
+  // re-proven, the `(task_id, voter)` dedup + `V_MAX` cap applied, and the vote
+  // recorded. Weight = the voter's reputation to the task's recipient.
+  vote : (text) -> (TaskResult);
+}
