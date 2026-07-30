@@ -4,9 +4,11 @@
 //! pull price, fee, chain id, factory, and verdict domain all come from
 //! `config/`. Solana addresses (`fee_wallet`, `factory`) are base58-decoded to
 //! `[u8; 32]`; a placeholder decodes to zero (a hard error on the frozen
-//! `mainnet` profile). Unlike tasks there is **no** `min_gross` — a collection's
-//! contributions are free-floating and the floor is amortized across `N` donors.
+//! `mainnet` profile). `min_gross` is the per-contribution floor: the signature
+//! amortizes across `N` donors, but the worst case is `N = 1`, so the floor is
+//! what keeps a one-contribution collection non-negative (`cost.md §5,§6`).
 
+use crown_games_common::config_bake::{addr as decode_addr, str_of, u128_of};
 use std::{env, fs, path::Path};
 
 fn main() {
@@ -27,11 +29,14 @@ fn main() {
     let approval_threshold = u16::try_from(u128_of(&text, "approval_threshold"))
         .unwrap_or_else(|_| panic!("`approval_threshold` out of u16 range"));
     let quorum_weight = u128_of(&text, "quorum_weight");
+    let min_gross = u128_of(&text, "min_gross") as u64;
     let sign_price = u128_of(&text, "sign_price");
+    let root_price = u128_of(&text, "root_price");
     // slot→time anchor (spec §Тайминги: "slot→time by a pinned SLOTS_PER_SECOND").
     // `slot_ms = 1000 / SLOTS_PER_SECOND`. The genesis anchor is a per-cluster
-    // network fact — a placeholder (0) until F5(devnet)/P8(mainnet); mainnet
-    // requires a real anchor (a zero `genesis_unix` is a hard error there).
+    // network fact: measured on devnet at F5, still a placeholder (0) on mainnet
+    // until P8 — where a zero `genesis_unix` is a hard error rather than a quiet
+    // decade-long offset.
     let slot_ms = u128_of(&text, "slot_ms") as u64;
     let genesis_slot = u128_of(&text, "genesis_slot") as u64;
     let genesis_unix = u128_of(&text, "genesis_unix") as u64;
@@ -40,9 +45,19 @@ fn main() {
     }
     let fee_bps = u16::try_from(u128_of(&text, "fee_bps"))
         .unwrap_or_else(|_| panic!("`fee_bps` out of u16 range"));
-    let fee_wallet = addr(&str_of(&text, "fee_wallet"), "fee_wallet", strict);
+    let fee_wallet = decode_addr(
+        &str_of(&text, "fee_wallet"),
+        "fee_wallet",
+        strict,
+        "conditional-funding",
+    );
     let chain_id = str_of(&text, "id");
-    let factory = addr(&str_of(&text, "factory"), "factory", strict);
+    let factory = decode_addr(
+        &str_of(&text, "factory"),
+        "factory",
+        strict,
+        "conditional-funding",
+    );
     let domain = str_of(&text, "domain");
 
     let out = format!(
@@ -58,8 +73,12 @@ fn main() {
          pub const APPROVAL_THRESHOLD: u16 = {approval_threshold};\n\
          /// Quorum weight (reputation minor units), baked into every `collection_id`.\n\
          pub const QUORUM_WEIGHT: u128 = {quorum_weight};\n\
+         /// Per-contribution floor (cost.md §5,§6); worst case is `N = 1`.\n\
+         pub const MIN_GROSS: u64 = {min_gross};\n\
          /// Price charged for a verdict signature (<= relay SIGN_PRICE).\n\
          pub const SIGN_PRICE: u128 = {sign_price};\n\
+         /// Price charged for a certified-root refresh (covers the BLS pairings).\n\
+         pub const ROOT_PRICE: u128 = {root_price};\n\
          pub const FEE_BPS: u16 = {fee_bps};\n\
          /// Fee wallet (Solana address). Zero if a placeholder.\n\
          pub const FEE_WALLET: [u8; 32] = {fee_wallet:?};\n\
@@ -71,48 +90,11 @@ fn main() {
          pub const DOMAIN: &str = {domain:?};\n\
          /// Milliseconds per Solana slot (`1000 / SLOTS_PER_SECOND`).\n\
          pub const SLOT_MS: u64 = {slot_ms};\n\
-         /// Anchor slot for the slot→time conversion (placeholder until F5/P8).\n\
+         /// Anchor slot for slot→time. Measured on devnet (F5); mainnet pinned at P8.\n\
          pub const GENESIS_SLOT: u64 = {genesis_slot};\n\
-         /// Anchor unix time (seconds) for the slot→time conversion (placeholder until F5/P8).\n\
+         /// Anchor unix time (seconds) for slot→time. Measured on devnet (F5).\n\
          pub const GENESIS_UNIX: u64 = {genesis_unix};\n",
     );
     let dst = Path::new(&env::var("OUT_DIR").unwrap()).join("config.rs");
     fs::write(&dst, out).unwrap();
-}
-
-fn str_of(text: &str, key: &str) -> String {
-    text.lines()
-        .find_map(|l| {
-            let rest = l.trim().strip_prefix(key)?.trim_start().strip_prefix('=')?;
-            let rest = rest.split('#').next().unwrap_or(rest).trim();
-            Some(rest.trim_matches('"').to_string())
-        })
-        .unwrap_or_else(|| panic!("missing `{key}` in config"))
-}
-
-fn u128_of(text: &str, key: &str) -> u128 {
-    let raw = str_of(text, key);
-    raw.replace('_', "")
-        .parse()
-        .unwrap_or_else(|_| panic!("`{key}` = `{raw}` is not an integer"))
-}
-
-/// Base58-decode an address; a placeholder → zero (a hard error on mainnet).
-fn addr(s: &str, what: &str, strict: bool) -> [u8; 32] {
-    match bs58::decode(s).into_vec() {
-        Ok(v) if v.len() == 32 => {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&v);
-            a
-        }
-        _ => {
-            if strict {
-                panic!("`{what}` = `{s}` is not a valid address (mainnet requires real addresses)");
-            }
-            println!(
-                "cargo:warning=conditional-funding: `{what}` is a placeholder (`{s}`) — baked as unset"
-            );
-            [0u8; 32]
-        }
-    }
 }

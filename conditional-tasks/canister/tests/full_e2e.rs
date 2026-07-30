@@ -21,15 +21,37 @@ use solana_sdk::{
     transaction::Transaction,
 };
 
-const KEY1_TASKS_WASM: &str =
-    "../target/pocketic/wasm32-unknown-unknown/release/conditional_tasks.wasm";
-const VOTING_PERIOD: u64 = 120; // config::VOTING_PERIOD (pocketic profile)
+const GAME_WASM: &str = "../target/e2e/wasm32-unknown-unknown/release/conditional_tasks.wasm";
+const VOTING_PERIOD: u64 = 120; // config::VOTING_PERIOD (testnet profile)
+                                // The fee is the game's price list, not a request field (harness §9): these are
+                                // `config::FEE_BPS` / `config::FEE_WALLET` of the testnet profile, and the escrow
+                                // must be born with exactly them or it derives to a different address.
+const FEE_BPS: u16 = 300;
+const FEE_WALLET_B58: &str = "FS6ZNuPxXqWSGzwXEQpfoxikDksbEzmrXGZDFXmFj6vS";
 const SEP: &str = "\n---\n";
 
-/// Build the conditional-tasks wasm with the `pocketic` profile (`threshold_key =
-/// key_1`, `factory = <two-outcome>`) in an isolated target dir.
-fn tasks_key1_wasm() -> Vec<u8> {
-    if !std::path::Path::new(KEY1_TASKS_WASM).exists() {
+fn fee_wallet() -> [u8; 32] {
+    bs58::decode(FEE_WALLET_B58)
+        .into_vec()
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
+
+/// Build the conditional-tasks wasm into an isolated target dir — not to select a
+/// profile (there is one devnet profile, `testnet`, and it names the key the
+/// replica actually provisions), but so this nested `cargo build` never contends
+/// with the outer `cargo test` for the workspace build lock.
+///
+/// Always invoked, never skipped on "the file is already there": these bytes
+/// depend on `config/testnet.toml`, and an artifact cached from an earlier
+/// config silently disagrees with the ids this test derives. A stale `fee_wallet`
+/// alone moves every escrow address, so the birth proof lands nowhere and the
+/// boundary drops a perfectly valid `register_task` with nothing to read but
+/// "rejected" — which is exactly how this was found. Cargo no-ops when nothing
+/// changed, so the guard costs nothing.
+fn tasks_game_wasm() -> Vec<u8> {
+    {
         let status = std::process::Command::new("cargo")
             .args([
                 "build",
@@ -39,14 +61,13 @@ fn tasks_key1_wasm() -> Vec<u8> {
                 "--target",
                 "wasm32-unknown-unknown",
                 "--target-dir",
-                "../target/pocketic",
+                "../target/e2e",
             ])
-            .env("CROWN_PROFILE", "pocketic")
             .status()
-            .expect("build conditional-tasks (pocketic)");
+            .expect("build conditional-tasks wasm");
         assert!(status.success());
     }
-    std::fs::read(KEY1_TASKS_WASM).expect("read key_1 tasks wasm")
+    std::fs::read(GAME_WASM).expect("read conditional-tasks wasm")
 }
 
 /// `<message>\n---\npubkey: ..\nsignature: ..\n<extras>` (tasks request wire format).
@@ -60,18 +81,21 @@ fn signed_request(sk: &SigningKey, message: &str, extras: &[(&str, String)]) -> 
     out
 }
 
-const INGEST_PRICE: u128 = 10_000_000_000; // crown-indexer config
+// crown-indexer `config/testnet.toml`. Must track it: the index accepts nothing
+// below its own INGEST_PRICE, so a stale value here reads as `Underpaid` and the
+// ingest silently folds nothing.
+const INGEST_PRICE: u128 = 13_700_000_000;
 const SOL_RPC: [u8; 10] = [0, 0, 0, 0, 2, 48, 4, 68, 1, 1]; // tghme-zyaaa-aaaar-qarca-cai
-const TWO_OUTCOME_FACTORY: &str = "9Cjb4fcyQyn3bMaNnkyrhMkG6dfEoo6DJzax7YWGynYb"; // pinned in the index
+const TWO_OUTCOME_FACTORY: &str = "BGVQrwSwkFQspL69DjGBFgKSgL6rutPqgcgEskmi8A4y"; // pinned in the index
 
 const INDEX_WASM: &str =
     "../../../crown-indexer/target/wasm32-unknown-unknown/release/crown_indexer.wasm";
-const MOCK_DIR: &str = "../e2e/mock-sol-rpc";
+const MOCK_DIR: &str = "../../e2e-fixtures/mock-sol-rpc";
 const MOCK_WASM: &str =
-    "../e2e/mock-sol-rpc/target/wasm32-unknown-unknown/release/mock_sol_rpc.wasm";
-const PROXY_DIR: &str = "../e2e/relay-proxy";
+    "../../e2e-fixtures/mock-sol-rpc/target/wasm32-unknown-unknown/release/mock_sol_rpc.wasm";
+const PROXY_DIR: &str = "../../e2e-fixtures/relay-proxy";
 const PROXY_WASM: &str =
-    "../e2e/relay-proxy/target/wasm32-unknown-unknown/release/relay_proxy.wasm";
+    "../../e2e-fixtures/relay-proxy/target/wasm32-unknown-unknown/release/relay_proxy.wasm";
 
 // Local mirrors of the index's `.did` result types.
 #[derive(CandidType, Deserialize, Debug)]
@@ -293,8 +317,13 @@ fn ingest_folds_a_mocked_create_escrow_into_a_birth() {
 
     // Preload the mock's `getTransaction` reply.
     let reply = consistent_reply(birth_tx(donor, escrow, salt), 424_242);
-    pic.update_call(mock, anon(), "set_reply", Encode!(&reply).unwrap())
-        .expect("set_reply");
+    pic.update_call(
+        mock,
+        anon(),
+        "set_reply",
+        Encode!(&Encode!(&reply).unwrap()).unwrap(),
+    )
+    .expect("set_reply");
 
     // Paid ingest through the relay proxy (ingress carries no cycles).
     let sig = "sig-birth-1".to_string();
@@ -333,9 +362,13 @@ fn ingest_folds_a_mocked_create_escrow_into_a_birth() {
 /// escrow's resolver. Everything but the Solana claim, on a PocketIC replica.
 #[test]
 fn register_decline_and_sign_a_real_verdict() {
+    // Build the game wasm *before* the replica exists. The nested `cargo build` can
+    // take a minute on a cold target dir, and an idle PocketIC instance gives up
+    // waiting — a timeout that reads as a broken test rather than a slow one.
+    let game_bytes = tasks_game_wasm();
     let (pic, index, mock, proxy) = setup();
 
-    // Tasks canister, built with `key_1`, wired to THIS index + the replica root key.
+    // Tasks canister wired to THIS index + the replica root key.
     let root_key = pic.root_key().expect("nns root key");
     let app = pic.topology().get_app_subnets()[0];
     let tasks = pic.create_canister_on_subnet(None, None, app);
@@ -344,7 +377,7 @@ fn register_decline_and_sign_a_real_verdict() {
         nns_root_key: root_key,
         index,
     });
-    pic.install_canister(tasks, tasks_key1_wasm(), Encode!(&init).unwrap(), None);
+    pic.install_canister(tasks, game_bytes, Encode!(&init).unwrap(), None);
     let b = pic
         .update_call(tasks, anon(), "bootstrap", Encode!().unwrap())
         .expect("bootstrap");
@@ -360,8 +393,6 @@ fn register_decline_and_sign_a_real_verdict() {
     let recipient_sk = SigningKey::from_bytes(&[5u8; 32]);
     let recipient = recipient_sk.verifying_key().to_bytes();
     let gross = 2_000_000u64;
-    let fee_bps = 300u16;
-    let fee_wallet = [2u8; 32];
     let nonce = 1u64;
     let duration = 100_000u64;
     // Far future (year ~2096): comfortably past `now + duration + voting_period +
@@ -373,8 +404,8 @@ fn register_decline_and_sign_a_real_verdict() {
         recipient,
         gross,
         deadline,
-        fee_bps,
-        fee_wallet,
+        FEE_BPS,
+        fee_wallet(),
         nonce,
         duration,
         VOTING_PERIOD,
@@ -393,7 +424,14 @@ fn register_decline_and_sign_a_real_verdict() {
 
     // The escrow address the birth must live at (= what register re-derives).
     let salt = crown_salt::two_outcome::two_outcome(
-        donor_pk, recipient, gross, deadline, resolver, fee_bps, fee_wallet, nonce,
+        donor_pk,
+        recipient,
+        gross,
+        deadline,
+        resolver,
+        FEE_BPS,
+        fee_wallet(),
+        nonce,
     );
     let (escrow_arr, _) = crown_derive::solana_pda_address(factory(), &[b"escrow", &salt]).unwrap();
     let escrow = Pubkey::new_from_array(escrow_arr);
@@ -403,8 +441,13 @@ fn register_decline_and_sign_a_real_verdict() {
         birth_tx(Pubkey::new_from_array(donor_pk), escrow, salt),
         555,
     );
-    pic.update_call(mock, anon(), "set_reply", Encode!(&reply).unwrap())
-        .expect("set_reply");
+    pic.update_call(
+        mock,
+        anon(),
+        "set_reply",
+        Encode!(&Encode!(&reply).unwrap()).unwrap(),
+    )
+    .expect("set_reply");
     let inner = Encode!(&"sig-reg-1".to_string()).unwrap();
     let arg = Encode!(&index, &"ingest".to_string(), &inner, &INGEST_PRICE).unwrap();
     let ir = pic
@@ -446,23 +489,99 @@ fn register_decline_and_sign_a_real_verdict() {
         ("recipient", bs58::encode(recipient).into_string()),
         ("gross", gross.to_string()),
         ("deadline", deadline.to_string()),
-        ("fee_bps", fee_bps.to_string()),
-        ("fee_wallet", bs58::encode(fee_wallet).into_string()),
         ("nonce", nonce.to_string()),
-        ("cert", hex::encode(&cert)),
         ("witness", hex::encode(&witness)),
     ];
     let register_text = signed_request(&donor, &msg, &extras);
-    // Route register through the proxy (inter-canister → skips `inspect_message`):
-    // the birth-proof BLS check exceeds the tight `inspect_message` budget (200M
-    // instructions), so a direct ingress register is rejected before it runs. The
-    // update itself, with the full instruction budget, materializes.
-    let reg_inner = Encode!(&register_text).unwrap();
-    let reg_arg = Encode!(&tasks, &"register_task".to_string(), &reg_inner, &0u128).unwrap();
+
+    // Before any root is pushed the witness has nothing to reconstruct into, so
+    // the boundary refuses the very same request — for free, before any
+    // replicated execution (`cost.md §6` #2).
+    let early = pic.update_call(
+        tasks,
+        anon(),
+        "register_task",
+        Encode!(&register_text).unwrap(),
+    );
+    assert!(
+        early.is_err(),
+        "no cached root → the boundary drops register, it never executes"
+    );
+
+    // Paid root refresh through the proxy (ingress carries no cycles).
+    let root_arg = Encode!(
+        &tasks,
+        &"push_root".to_string(),
+        &Encode!(&cert).unwrap(),
+        &1_000_000_000u128
+    )
+    .unwrap();
+    let pr = pic
+        .update_call(proxy, anon(), "relay", root_arg)
+        .expect("relay push_root");
+    assert!(
+        matches!(
+            Decode!(&Decode!(&pr, Vec<u8>).unwrap(), TaskResult).unwrap(),
+            TaskResult::RootPushed
+        ),
+        "the index certificate authenticates a root"
+    );
+
+    // The fee is the game's price list, not the donor's (harness §9). A donor who
+    // bakes `fee_wallet = self` into the escrow and presents the matching `task_id`
+    // is refused: the canister recomputes the id with `config::FEE_BPS/FEE_WALLET`,
+    // so a self-dealt fee can never reach a paid verdict signature. Rejected either
+    // at the boundary or by the update — both are the contract (harness §6).
+    let stolen_id = protocol::task_id(
+        tasks.as_slice(),
+        donor_pk,
+        recipient,
+        gross,
+        deadline,
+        0,        // fee_bps: no fee at all
+        donor_pk, // fee_wallet: the donor's own wallet
+        nonce,
+        duration,
+        VOTING_PERIOD,
+    );
+    let stolen_msg = protocol::register_message(
+        "devnet",
+        &tasks.to_text(),
+        &bs58::encode(stolen_id).into_string(),
+        &hex::encode(text_hash),
+        duration,
+    );
+    let stolen_text = signed_request(&donor, &stolen_msg, &extras);
+    // Either half of the rule is a pass: the boundary drops it (`Err`), or the
+    // replicated `update` refuses it as a mismatch. Both mean a self-dealt fee
+    // never derives to a task this canister will accept.
+    if let Ok(bytes) = pic.update_call(
+        tasks,
+        anon(),
+        "register_task",
+        Encode!(&stolen_text).unwrap(),
+    ) {
+        assert!(
+            matches!(
+                Decode!(&bytes, TaskResult).unwrap(),
+                TaskResult::TaskIdMismatch
+            ),
+            "a self-dealt fee must not derive to a task the canister accepts"
+        );
+    }
+
+    // Register as a **direct ingress** — what a real donor wallet sends. This is
+    // the boundary contract: with the certificate's BLS moved to `push_root`, the
+    // witness walk fits `inspect_message`, so the call is admitted and executes.
     let rr = pic
-        .update_call(proxy, anon(), "relay", reg_arg)
-        .expect("relay register_task");
-    let res = Decode!(&Decode!(&rr, Vec<u8>).unwrap(), TaskResult).unwrap();
+        .update_call(
+            tasks,
+            anon(),
+            "register_task",
+            Encode!(&register_text).unwrap(),
+        )
+        .expect("direct ingress register must be admitted");
+    let res = Decode!(&rr, TaskResult).unwrap();
     assert!(
         matches!(res, TaskResult::Materialized),
         "register must materialize the task: {res:?}"

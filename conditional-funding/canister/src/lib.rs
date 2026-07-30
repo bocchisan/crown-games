@@ -26,7 +26,9 @@ pub mod validate;
 // derivation, escrow-address PDA, wallet signature) lives in one place —
 // `crown-games-common`. Re-exported to keep `birth::`/`address::`/`resolver::`/
 // `request::` call sites uniform across every game.
-pub use crown_games_common::{address, birth, bs58_array, request, resolver};
+pub use crown_games_common::{
+    address, birth, bs58_array, field, request, resolver, roots, signing, MAX_ARG_BYTES, V_MAX,
+};
 
 thread_local! {
     /// Cached threshold master (public key + chain code); resolvers derive from it.
@@ -35,17 +37,12 @@ thread_local! {
     static INDEX: RefCell<Principal> = const { RefCell::new(Principal::anonymous()) };
     /// NNS root key that authenticates the index's certificate (blind proof).
     static NNS_ROOT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Recently verified index roots (newest last). A birth/reputation witness is
+    /// admitted against any of them; the BLS that authenticates a root runs once,
+    /// on the paid `push_root`, never on the anonymous boundary. Canister state,
+    /// so it lives here; the cache policy is `roots` (one copy for every game).
+    static ROOTS: RefCell<Vec<[u8; 32]>> = const { RefCell::new(Vec::new()) };
 }
-
-/// IC mainnet root key — finalized at P8 (the pinned NNS BLS key; fill from the
-/// official published value, never a guessed constant). On testnet it is supplied
-/// via `init`. Empty fails every birth proof closed (safe), and on the mainnet
-/// profile `init` traps rather than ship a dead trust anchor (mirrors the
-/// `genesis_unix == 0` build guard).
-const IC_MAINNET_ROOT_KEY: &[u8] = &[];
-
-/// Cap of votes per collection (non-negativity invariant #7; cost.md §6 `V_MAX`).
-const V_MAX: usize = 500;
 
 /// Deploy-time overrides (testnet): the index principal and the NNS root key
 /// (PocketIC / a test IC differ from mainnet). Barred on mainnet.
@@ -62,6 +59,13 @@ pub enum CollectionStateView {
     Voting,
     DecidedSettle,
     DecidedRefund,
+}
+
+/// A produced verdict signature, for `get_signature`.
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct SignatureView {
+    pub outcome: u8,
+    pub signature: Vec<u8>,
 }
 
 /// Outcome of an update — flat and typed.
@@ -81,6 +85,8 @@ pub enum CollectionResult {
         outcome: u8,
         signature: Vec<u8>,
     },
+    /// A certified index root was authenticated and cached.
+    RootPushed,
     // wiring / request
     Malformed,
     WrongTarget,
@@ -89,10 +95,14 @@ pub enum CollectionResult {
     BadBirthProof,
     FieldMismatch,
     CreatedAtOverflow,
-    Underpaid,  // attached cycles below SIGN_PRICE
+    Underpaid,  // attached cycles below SIGN_PRICE / ROOT_PRICE
     NotDecided, // verdict not yet finalized
     SignFailed, // sign_with_schnorr rejected
+    /// A sibling call is already signing this scope — free, no charge. Retry and
+    /// the produced signature is served from store.
+    SignInFlight,
     // registration validation
+    GrossBelowFloor,
     DurationOutOfRange,
     DeadlineTooTight,
     TimeOverflow,
@@ -123,11 +133,8 @@ fn init(overrides: Option<InitArgs>) {
         None => {
             let index = Principal::from_text(config::CROWN_INDEX)
                 .unwrap_or_else(|_| ic_cdk::trap("baked index principal is invalid"));
-            if config::PROFILE == "mainnet" && IC_MAINNET_ROOT_KEY.is_empty() {
-                ic_cdk::trap("IC_MAINNET_ROOT_KEY is unset (P8: pin the NNS root key before mainnet)");
-            }
             INDEX.with_borrow_mut(|i| *i = index);
-            NNS_ROOT.with_borrow_mut(|k| *k = IC_MAINNET_ROOT_KEY.to_vec());
+            NNS_ROOT.with_borrow_mut(|k| *k = crown_games_common::IC_MAINNET_ROOT_KEY.to_vec());
         }
     }
 }
@@ -224,12 +231,6 @@ fn vote(text: String) -> CollectionResult {
     }
 }
 
-/// Largest ingress arg accepted. A legitimate signed request — even a birth
-/// proof carrying a hex `cert` + `witness` — is a few KB; this leaves ample
-/// headroom while dropping a multi-MB flood before it can force parsing, hex
-/// decoding, or (on the vote path) BLS verification. Mirrors the relay's guard.
-const MAX_ARG_BYTES: usize = 32 * 1024;
-
 /// The boundary (non-negativity invariant #2, harness §6): a state-changing
 /// ingress is admitted only if it would pass — its `admit_*` check (signature +
 /// target + applicability proof) holds. Doomed/spam work never reaches the
@@ -260,6 +261,35 @@ fn inspect_message() {
     }
 }
 
+/// Paid pull (fronted by the relay for `ROOT_PRICE`): authenticate a fresh index
+/// root and cache it, so the anonymous boundary can admit birth/reputation
+/// witnesses with a hash-tree walk alone.
+///
+/// The certificate costs two BLS pairings (the index's signature plus the subnet
+/// delegation) — far past the 200M-instruction budget of `inspect_message`, so it
+/// cannot live there; and free on `update` it would be a replicated pairing for
+/// any anonymous byte string. Charging it makes the one expensive step the paid
+/// one and keeps every per-caller path cheap (`cost.md §6` #2).
+///
+/// Payment is accepted **before** the pairings, and a bogus certificate is not
+/// refunded: fund-then-fail must not be cheaper than the work it triggers
+/// (`01-standards §Тесты 4`).
+#[ic_cdk::update]
+fn push_root(cert: Vec<u8>) -> CollectionResult {
+    if ic_cdk::api::msg_cycles_available() < config::ROOT_PRICE {
+        return CollectionResult::Underpaid;
+    }
+    ic_cdk::api::msg_cycles_accept(config::ROOT_PRICE);
+
+    let index = INDEX.with_borrow(|i| *i);
+    let root_key = NNS_ROOT.with_borrow(|k| k.clone());
+    let Some(root) = birth::certified_root(&cert, &root_key, index.as_slice()) else {
+        return CollectionResult::BadBirthProof;
+    };
+    ROOTS.with_borrow_mut(|cache| roots::remember(cache, root));
+    CollectionResult::RootPushed
+}
+
 /// Paid pull (fronted by the relay for `SIGN_PRICE`): the per-collection resolver
 /// signs the finalized verdict — **one** signature reused by all `N` escrows
 /// (they share `resolver = key([collection_id])`), which is the atomicity: a
@@ -268,20 +298,32 @@ fn inspect_message() {
 /// collection is refused without charge.
 #[ic_cdk::update]
 async fn request_signature(chain: String, collection: String) -> CollectionResult {
-    if ic_cdk::api::msg_cycles_available() < config::SIGN_PRICE {
-        return CollectionResult::Underpaid;
-    }
     if chain != config::CHAIN_ID {
         return CollectionResult::WrongTarget;
     }
-    let Some(collection_id) = hex32(&collection) else {
+    let Some(collection_id) = field::hex32(&collection) else {
         return CollectionResult::Malformed;
     };
+    // Already signed → the same bytes, for free. Ahead of the payment check on
+    // purpose: a repeat costs one read, so it is never worth charging for. This
+    // is also what makes "one signature reused by all N escrows" an amortization
+    // in fact — the second escrow to claim pays nothing.
+    if let Some((outcome, signature)) = signing::cached(&collection_id) {
+        return CollectionResult::Signed { outcome, signature };
+    }
+    if ic_cdk::api::msg_cycles_available() < config::SIGN_PRICE {
+        return CollectionResult::Underpaid;
+    }
     let outcome = match state::verdict(&collection_id, now_secs()) {
         Some(Outcome::Settle) => 0u8,
         Some(Outcome::Refund) => 1u8,
         None => return CollectionResult::NotDecided, // no charge until final
     };
+    // Claim the scope *before* the await: the store only lands after it, so
+    // without this N concurrent requests would each miss the store and each pay.
+    if !signing::claim(collection_id) {
+        return CollectionResult::SignInFlight;
+    }
 
     // Payment accepted only now, before the (paid) threshold signature.
     ic_cdk::api::msg_cycles_accept(config::SIGN_PRICE);
@@ -295,11 +337,17 @@ async fn request_signature(chain: String, collection: String) -> CollectionResul
         aux: None,
     };
     match sign_with_schnorr(&arg).await {
-        Ok(res) => CollectionResult::Signed {
-            outcome,
-            signature: res.signature,
-        },
-        Err(_) => CollectionResult::SignFailed,
+        Ok(res) => {
+            signing::store(collection_id, outcome, res.signature.clone());
+            CollectionResult::Signed {
+                outcome,
+                signature: res.signature,
+            }
+        }
+        Err(_) => {
+            signing::release(&collection_id); // keep the scope retriable
+            CollectionResult::SignFailed
+        }
     }
 }
 
@@ -312,14 +360,24 @@ fn get_logic_version() -> u32 {
 
 #[ic_cdk::query]
 fn get_resolver(collection: String) -> Option<String> {
-    let id = hex32(&collection)?;
+    let id = field::hex32(&collection)?;
     let (pk, cc) = MASTER.with_borrow(|m| *m)?;
     resolver::resolver(&pk, &cc, &id).map(|r| bs58::encode(r).into_string())
 }
 
+/// The verdict signature already produced for a collection, if any. Free query —
+/// every escrow after the first reads the bytes here instead of paying the relay
+/// to re-request a `SIGN_PRICE` pull for a signature that already exists.
+#[ic_cdk::query]
+fn get_signature(collection: String) -> Option<SignatureView> {
+    let id = field::hex32(&collection)?;
+    let (outcome, signature) = signing::cached(&id)?;
+    Some(SignatureView { outcome, signature })
+}
+
 #[ic_cdk::query]
 fn get_collection(collection: String) -> Option<CollectionStateView> {
-    let id = hex32(&collection)?;
+    let id = field::hex32(&collection)?;
     state::collection_state(&id, now_secs()).map(state_view)
 }
 
@@ -330,7 +388,7 @@ fn recipient_action(
     action_name: &str,
     action: conditional_funding_logic::Action,
 ) -> CollectionResult {
-    let (collection_id, signer) = match admit_action(text, action_name) {
+    let (collection_id, signer) = match admit_action(text, action_name, &action) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -341,26 +399,23 @@ fn recipient_action(
 }
 
 /// The voter's weight = their reputation to the collection's recipient, proven by
-/// the book witness against the certified index root. `None` if the proof is
-/// invalid or the collection is unknown.
+/// the book witness against an already-authenticated index root. `None` if the
+/// proof is invalid or the collection is unknown.
+///
+/// Like the birth proof, this is a pure hash-tree walk against the `ROOTS` cache
+/// (`push_root` did the BLS, paid). The certificate must not be verified here:
+/// `admit_vote` runs at the boundary, and two pairings per anonymous vote would
+/// blow the 200M-instruction `inspect_message` budget — a *valid* vote could not
+/// be admitted at all (spec §Методы, `cost.md §6` #2).
 fn voter_weight(
     req: &request::Request,
     collection_id: &[u8; 32],
     voter: &[u8; 32],
 ) -> Option<u128> {
     let recipient = state::collection_recipient(collection_id)?;
-    let cert = hex_vec(req.extra("cert"))?;
-    let weight_witness = hex_vec(req.extra("weight_witness"))?;
-    let index = INDEX.with_borrow(|i| *i);
-    let root_key = NNS_ROOT.with_borrow(|k| k.clone());
-    let combined_root = birth::certified_root(&cert, &root_key, index.as_slice())?;
-    birth::reputation_from_witness(
-        &weight_witness,
-        &combined_root,
-        &chain_id_hash(),
-        voter,
-        &recipient,
-    )
+    let weight_witness = field::hex_bytes(req.extra("weight_witness"))?;
+    let chain = crown_games_common::chain_id(config::CHAIN_ID);
+    ROOTS.with_borrow(|cache| roots::reputation(cache, &weight_witness, &chain, voter, &recipient))
 }
 
 // ---- Boundary admissibility (harness §6) ----
@@ -412,9 +467,9 @@ fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
     }
     let recipient = req.pubkey; // the recipient opens their own collection
     let (Some(collection_claimed), Some(duration), Some(recipient_nonce)) = (
-        req.signed("collection").and_then(hex32),
-        req.signed("duration").and_then(|s| parse_u64(Some(s))),
-        parse_u64(req.extra("recipient_nonce")),
+        req.signed("collection").and_then(field::hex32),
+        req.signed("duration").and_then(|s| field::u64_of(Some(s))),
+        field::u64_of(req.extra("recipient_nonce")),
     ) else {
         return Err(CollectionResult::Malformed);
     };
@@ -440,9 +495,9 @@ fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
     };
 
     // No birth proof → derivation echo only (harness: create without a proof
-    // grows no memory).
-    let (Some(cert), Some(witness)) = (hex_vec(req.extra("cert")), hex_vec(req.extra("witness")))
-    else {
+    // grows no memory). Only the witness is needed: the root it reconstructs
+    // against was authenticated earlier, on the paid `push_root`.
+    let Some(witness) = field::hex_bytes(req.extra("witness")) else {
         return Ok(Admitted::Echo {
             collection_id,
             resolver_key,
@@ -453,9 +508,9 @@ fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
     // the birth proof at the derived address).
     let (Some(donor), Some(gross), Some(deadline), Some(nonce)) = (
         req.extra("donor").and_then(bs58_array::<32>),
-        parse_u64(req.extra("gross")),
-        parse_i64(req.extra("deadline")),
-        parse_u64(req.extra("nonce")),
+        field::u64_of(req.extra("gross")),
+        field::i64_of(req.extra("deadline")),
+        field::u64_of(req.extra("nonce")),
     ) else {
         return Err(CollectionResult::Malformed);
     };
@@ -484,13 +539,11 @@ fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
         return Err(CollectionResult::AlreadyExists);
     }
 
-    // Blind birth proof: certificate (BLS vs NNS root) → root → witness → birth.
-    let index = INDEX.with_borrow(|i| *i);
-    let root_key = NNS_ROOT.with_borrow(|k| k.clone());
-    let Some(combined_root) = birth::certified_root(&cert, &root_key, index.as_slice()) else {
-        return Err(CollectionResult::BadBirthProof);
-    };
-    let Some(b) = birth::birth_from_witness(&witness, &combined_root, &escrow) else {
+    // Blind birth proof, boundary half: the witness is reconstructed against an
+    // already-authenticated index root (`push_root` did the BLS, paid). A pure
+    // hash-tree walk, O(log n) — it fits the `inspect_message` budget, which the
+    // certificate's pairings do not (`push_root`).
+    let Some((_, b)) = ROOTS.with_borrow(|cache| roots::birth(cache, &witness, &escrow)) else {
         return Err(CollectionResult::BadBirthProof);
     };
     // `gross` is committed via the escrow address, so the birth leaf no longer
@@ -506,12 +559,13 @@ fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
         return Err(CollectionResult::CreatedAtOverflow);
     };
     let inp = validate::RegInputs {
+        gross,
         duration,
         voting_period: config::VOTING_PERIOD,
         created_at,
         deadline,
     };
-    if let Err(e) = validate::validate_registration(&inp) {
+    if let Err(e) = validate::validate_registration(&inp, config::MIN_GROSS) {
         return Err(reg_error(e));
     }
 
@@ -532,24 +586,33 @@ fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
 }
 
 /// Admit a recipient action (`ready`/`recipient_cancel`): signature + target +
-/// the signer is the collection's recipient. Returns `(collection_id, signer)`;
-/// the update's `state::recipient_action` stays authoritative on the transition.
-/// Mirrors the state op's order exactly — `NotFound` when the collection is
-/// absent, `NotRecipient` when the signer is not its recipient.
-fn admit_action(text: &str, action_name: &str) -> Result<([u8; 32], [u8; 32]), CollectionResult> {
+/// the signer is the collection's recipient + the stored state still admits the
+/// action. Returns `(collection_id, signer)`; the update's
+/// `state::recipient_action` stays authoritative (it advances the clock first, so
+/// it may still refuse). Mirrors the state op's order exactly — `NotFound` when
+/// the collection is absent, `NotRecipient` when the signer is not its recipient.
+///
+/// The state check is the point (harness §6, `cost.md §6` #2): without it every
+/// action from the right signer was admitted and the doomed ones were executed
+/// replicated at the canister's expense — free for the sender, and unbounded,
+/// since the signed half of a request carries no nonce and replays.
+fn admit_action(
+    text: &str,
+    action_name: &str,
+    action: &conditional_funding_logic::Action,
+) -> Result<([u8; 32], [u8; 32]), CollectionResult> {
     let Some(req) = request::parse(text) else {
         return Err(CollectionResult::Malformed);
     };
     if req.signed("action") != Some(action_name) || !target_ok(&req) {
         return Err(CollectionResult::WrongTarget);
     }
-    let Some(collection_id) = req.signed("collection").and_then(hex32) else {
+    let Some(collection_id) = req.signed("collection").and_then(field::hex32) else {
         return Err(CollectionResult::Malformed);
     };
-    match state::collection_recipient(&collection_id) {
-        Some(r) if r == req.pubkey => Ok((collection_id, req.pubkey)),
-        Some(_) => Err(CollectionResult::NotRecipient),
-        None => Err(CollectionResult::NotFound),
+    match state::action_admits(&collection_id, &req.pubkey, action) {
+        Ok(()) => Ok((collection_id, req.pubkey)),
+        Err(e) => Err(state_error(e)),
     }
 }
 
@@ -563,10 +626,10 @@ fn admit_vote(text: &str) -> Result<([u8; 32], Vote), CollectionResult> {
     if req.signed("action") != Some("vote") || !target_ok(&req) {
         return Err(CollectionResult::WrongTarget);
     }
-    let Some(collection_id) = req.signed("collection").and_then(hex32) else {
+    let Some(collection_id) = req.signed("collection").and_then(field::hex32) else {
         return Err(CollectionResult::Malformed);
     };
-    let Some(done) = req.signed("choice").and_then(parse_choice) else {
+    let Some(done) = req.signed("choice").and_then(field::choice) else {
         return Err(CollectionResult::Malformed);
     };
     // Cheap committed-state gate *before* the weight proof (harness §6): a doomed
@@ -598,28 +661,16 @@ fn admit_vote(text: &str) -> Result<([u8; 32], Vote), CollectionResult> {
 fn admissible(method: &str, text: &str) -> bool {
     match method {
         "create_collection" => admit_create_collection(text).is_ok(),
-        "ready" => admit_action(text, "ready").is_ok(),
-        "recipient_cancel" => admit_action(text, "cancel").is_ok(),
+        "ready" => admit_action(text, "ready", &conditional_funding_logic::Action::Ready).is_ok(),
+        "recipient_cancel" => admit_action(
+            text,
+            "cancel",
+            &conditional_funding_logic::Action::RecipientCancel,
+        )
+        .is_ok(),
         "vote" => admit_vote(text).is_ok(),
         _ => false,
     }
-}
-
-fn parse_choice(c: &str) -> Option<bool> {
-    match c {
-        "done" => Some(true),
-        "not_done" => Some(false),
-        _ => None,
-    }
-}
-
-/// `ChainId` as the index keys the book: `sha256("crown-chain:v1:" ‖ id)`.
-fn chain_id_hash() -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"crown-chain:v1:");
-    h.update(config::CHAIN_ID.as_bytes());
-    h.finalize().into()
 }
 
 /// The signed `canister`/`chain` fields must target this canister and cluster.
@@ -649,6 +700,7 @@ fn state_view(s: State) -> CollectionStateView {
 fn reg_error(e: validate::RegError) -> CollectionResult {
     use validate::RegError as E;
     match e {
+        E::GrossBelowFloor => CollectionResult::GrossBelowFloor,
         E::DurationOutOfRange => CollectionResult::DurationOutOfRange,
         E::DeadlineTooTight => CollectionResult::DeadlineTooTight,
         E::TimeOverflow => CollectionResult::TimeOverflow,
@@ -668,19 +720,6 @@ fn state_error(e: state::StateError) -> CollectionResult {
         E::Step(Se::DuplicateVoter) => CollectionResult::DuplicateVoter,
         E::Step(Se::Overflow) => CollectionResult::StepOverflow,
     }
-}
-
-fn parse_u64(s: Option<&str>) -> Option<u64> {
-    s?.parse().ok()
-}
-fn parse_i64(s: Option<&str>) -> Option<i64> {
-    s?.parse().ok()
-}
-fn hex32(s: &str) -> Option<[u8; 32]> {
-    hex::decode(s).ok()?.try_into().ok()
-}
-fn hex_vec(s: Option<&str>) -> Option<Vec<u8>> {
-    hex::decode(s?).ok()
 }
 
 ic_cdk::export_candid!();

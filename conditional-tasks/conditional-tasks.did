@@ -1,30 +1,21 @@
 // Deploy-time overrides (testnet): the index principal and the NNS root key
 // (PocketIC / a test IC differ from mainnet). Barred on mainnet.
 type InitArgs = record { nns_root_key : blob; index : principal };
-// A recipient profile, for `get_profile`.
-type ProfileView = record {
-  counter : nat64;
-  enabled : bool;
-  min_gross : nat64;
-  min_reputation : nat;
-};
+// A produced verdict signature, for `get_signature`.
+type SignatureView = record { signature : blob; outcome : nat8 };
 // Outcome of an update — flat and typed.
 type TaskResult = variant {
-  StaleCounter;
   Advanced : TaskStateView;
   Underpaid;
   TaskIdMismatch;
-  ProfileMinBelowFloor;
-  ProfileDisabled;
   DurationOutOfRange;
-  ReputationBelowMinimum;
+  // A certified index root was authenticated and cached.
+  RootPushed;
   VoteCapReached;
-  ProfileCapReached;
   InvalidTransition;
   NotFound;
   NotBootstrapped;
   KeyBootstrapped;
-  GrossBelowMinimum;
   AlreadyExists;
   BadBirthProof;
   TimeOverflow;
@@ -32,12 +23,14 @@ type TaskResult = variant {
   FieldMismatch;
   NotDecided;
   Materialized;
+  // A sibling call is already signing this scope — free, no charge. Retry and
+  // the produced signature is served from store.
+  SignInFlight;
   GrossBelowFloor;
-  ProfileSet;
   SignFailed;
   DuplicateVoter;
   // A verdict signature: `outcome` (settle=0/cancel=1) + the schnorr signature.
-  Signed : record { signature : blob; outcome : nat8 };
+  Signed : SignatureView;
   WrongTarget;
   DeadlineTooTight;
   StepOverflow;
@@ -60,24 +53,49 @@ service : (opt InitArgs) -> {
   bootstrap : () -> (TaskResult);
   decline : (text) -> (TaskResult);
   get_logic_version : () -> (nat32) query;
-  get_profile : (text) -> (opt ProfileView) query;
   get_resolver : (text) -> (opt text) query;
+  // The verdict signature already produced for a scope, if any. Free query — a
+  // claimer that lost the race, or one that simply needs the bytes again, reads
+  // them here instead of paying the relay to re-request a `SIGN_PRICE` pull.
+  get_signature : (text) -> (opt SignatureView) query;
   get_task : (text) -> (opt TaskStateView) query;
   get_verdict : (text) -> (opt TaskStateView) query;
+  // Paid pull (fronted by the relay for `ROOT_PRICE`): authenticate a fresh index
+  // root and cache it, so the anonymous boundary can admit birth/reputation
+  // witnesses with a hash-tree walk alone.
+  // 
+  // The certificate costs two BLS pairings (the index's signature plus the subnet
+  // delegation) — far past the 200M-instruction budget of `inspect_message`, so it
+  // cannot live there; and free on `update` it would be a replicated pairing for
+  // any anonymous byte string. Charging it makes the one expensive step the paid
+  // one and keeps every per-caller path cheap (`cost.md §6` #2).
+  // 
+  // Payment is accepted **before** the pairings, and a bogus certificate is not
+  // refunded: fund-then-fail must not be cheaper than the work it triggers
+  // (`01-standards §Тесты 4`).
+  push_root : (blob) -> (TaskResult);
   ready : (text) -> (TaskResult);
-  // Lazy creation: derive `task_id`, verify the birth proof at the derived escrow
-  // address, validate registration, and materialize the `Created` task. Without a
-  // valid birth proof nothing is written.
+  // Lazy creation: admit the birth proof (via `admit_register`, also run at the
+  // boundary so a bogus proof never reaches here), validate registration against
+  // the current time, and materialize the `Created` task. Without a valid birth
+  // proof nothing is written.
   register_task : (text) -> (TaskResult);
   // Paid pull (fronted by the relay for `SIGN_PRICE`): the per-scope resolver
-  // signs the finalized verdict. Payment is accepted **before** `sign_with_schnorr`;
-  // a not-yet-`Decided` task is refused without charge. One signature per scope,
-  // reused by its escrow's `claim(outcome, sig)`.
+  // signs the finalized verdict. One signature per scope, reused by its escrow's
+  // `claim(outcome, sig)`.
+  // 
+  // Gate order mirrors the index's `ingest` (`crown-indexer/src/gate.rs`): the
+  // cheapest, most decisive check wins first, and only the last step may charge.
+  // A scope that was already signed is served **free** — the threshold signature
+  // is deterministic in `(scope, outcome)` and the outcome is immutable once
+  // `Decided` (harness §8), so re-signing would buy the same bytes twice. A
+  // not-yet-`Decided` task is refused without charge; payment is accepted only
+  // immediately before `sign_with_schnorr`, and on failure it is not refunded
+  // (`01-standards §Тесты 4`).
   request_signature : (text, text) -> (TaskResult);
-  set_profile : (text) -> (TaskResult);
-  // A reputation-weighted vote. Validity (signature + weight proof ≥
-  // `MIN_VOTE_WEIGHT`) is gated in `inspect_message` for free; here the weight is
-  // re-proven, the `(task_id, voter)` dedup + `V_MAX` cap applied, and the vote
-  // recorded. Weight = the voter's reputation to the task's recipient.
+  // A reputation-weighted vote. Admissibility (signature + weight proof ≥
+  // `MIN_VOTE_WEIGHT`) is gated at the boundary via `admit_vote`; here the same
+  // check runs authoritatively, then the `(task_id, voter)` dedup + `V_MAX` cap
+  // apply. Weight = the voter's reputation to the task's recipient.
   vote : (text) -> (TaskResult);
 }

@@ -4,7 +4,9 @@ threshold_key      = "key_1"
 voting_period      = 3600                   # mainnet; в прообразе collection_id
 approval_threshold = 5000
 quorum_weight      = 1_000_000
+min_gross          = 410_000               # флор вклада (cost.md §5, Funding $0.41 = be·1.2); cost-gate P8
 sign_price         = 35_800_000_000         # цена подписи сбора (harness §5; ≤ релейного SIGN_PRICE), амортизируется на N вкладов
+root_price         = 1_400_000_000          # цена обновления корня индекса (BLS-пары сертификата); cost-gate P8
 slot_ms            = 400                     # 1000/SLOTS_PER_SECOND (SLOTS_PER_SECOND=2.5)
 genesis_slot       = 0                       # якорь slot→unix — заполнить на P8 (freeze-gate: genesis_unix≠0)
 genesis_unix       = 0                       # якорь slot→unix — заполнить на P8 (freeze-gate: genesis_unix≠0)

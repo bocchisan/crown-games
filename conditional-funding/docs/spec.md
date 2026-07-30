@@ -77,8 +77,11 @@ settle ⇔ share > bar    (строго >)
 - `created_at` — **слот рождения первого профинансированного вклада** (детерминирован, из пруфа
   рождения; слот→время линейно по пиннутому якорю: `created_at = genesis_unix + (slot − genesis_slot)·slot_ms/1000`,
   где `slot_ms = 1000/SLOTS_PER_SECOND`; `slot_ms`/`genesis_slot`/`genesis_unix` — поля `config/`-профиля,
-  изолированы в `config::slot_to_created_at`, checked; плейсхолдеры до F5(devnet)/P8(mainnet), фриз-гейт
-  `genesis_unix≠0` на mainnet), фиксируется при материализации. Окно `Funding`:
+  изолированы в `config::slot_to_created_at`, checked; devnet-якорь **замерен** на F5 (`getBlockTime`
+  финализованного слота), mainnet — плейсхолдер до P8, фриз-гейт `genesis_unix≠0`), фиксируется при
+  материализации. Модель линейна по `slot_ms`, а сеть идёт чуть быстрее, поэтому `created_at` уползает
+  **вперёд** реального времени — сторона безопасная: окно сбора от этого шире, а не уже. Дрейф якоря
+  проверяет F5-драйвер до того, как двинутся деньги. Окно `Funding`:
   `[created_at, created_at + duration]`. `ready`/`recipient_cancel` валидны при `now < created_at+duration`.
 - `started_at` — канистерное время нажатия `ready`. Окно `Voting`: `[started_at, started_at+voting_period]`.
 - `goal` в код не входит; оверфандинг свободен; выплата = Σ собранного − комиссия (сумму считает сервер
@@ -97,6 +100,10 @@ settle ⇔ share > bar    (строго >)
 | `MIN_APPROVAL_THRESHOLD` | `5_000` (нижняя граница включительно) |
 | `APPROVAL_THRESHOLD_SCALE` | `10_000` (знаменатель и верхняя граница исключительно) |
 | `DEADLINE_MARGIN` | `72 ч` (забота UI, не в `logic/`) |
+| `V_MAX` | `500` | кэп голосов на сбор (инв. #7) |
+| `ROOT_CACHE` | `4` — сколько аутентифицированных корней индекса остаются допустимыми одновременно (§Методы, `push_root`) |
+| `MAX_ARG_BYTES` | `8 KiB` — кэп аргумента ingress; режется первым, до разбора; выведен из ёмкости поколения, не выбран (харнесс §6) |
+| `sign_price` / `root_price` | `26.2e9` / `1.0e9` (devnet), `35.8e9` / `1.4e9` (mainnet); оба ≤ релейных — цена оплаченного pull'а подписи и пуша корня |
 
 Создание: `duration ∈ [MIN_DURATION, MAX_DURATION]` (иначе `DurationOutOfRange`);
 `approval_threshold ∈ [5000, 10000)` (иначе `ThresholdOutOfRange`).
@@ -110,9 +117,17 @@ settle ⇔ share > bar    (строго >)
 
 Валидация при деплое: `approval_threshold ∈ [5000,10000)`; `quorum_weight ≥ MIN_VOTE_WEIGHT`;
 `fee_bps < 10000`; `domain` непуст; `id` непуст, `ascii_graphic`, без `:` и `\n`; цепи попарно различны
-по `(id, domain, factory)`; `factory`/`fee_wallet` base58 → 32 байта. Конфиг: `crown_index, threshold_key,
-voting_period, approval_threshold, quorum_weight`; per-chain `id, factory, domain, fee_bps, fee_wallet`.
-Нет: сплиттер, казна, RPC-URL, `min_gross`.
+по `(id, domain, factory)`; `factory`/`fee_wallet` base58 → 32 байта. Конфиг: `crown_index,
+threshold_key, voting_period, approval_threshold, quorum_weight, min_gross, sign_price, root_price` +
+якорь слот→время (`slot_ms, genesis_slot, genesis_unix`, §Тайминги); per-chain `id, factory, domain,
+fee_bps, fee_wallet`. Нет: сплиттер, казна, RPC-URL.
+
+**`min_gross` = флор вклада**, проверяется **первым** в `validate_registration` (до диапазона
+`duration` и запаса дедлайна): это самая дешёвая проверка, и обречённый пылевой вызов не должен
+стоить больше неё. Значение — `be·(1+MARGIN) ≈ $0.41` (`cost.md §5`), в конфиге `410_000`.
+Подпись сбора делится на `N` вкладов, но **худший случай — `N = 1`**, когда её не на что делить;
+флор считается по нему и тем самым покрывает все `N`. Алайнмент `MIN_GROSS ≥` индексного
+`MIN_GROSS` ($0.20) закреплён тестом конфига. Итоговое число — выход cost-gate на P8.
 
 ## Форматы сообщений
 
@@ -138,11 +153,32 @@ Ed25519 `verify_strict`, адрес = pubkey. Кодирование инъек�
 
 ## Методы (`.did`, фиксирован)
 
-`create_collection` · `ready` · `recipient_cancel` · `vote` · `request_signature` · queries
-(`get_collection`, `get_resolver` (`query`), `get_logic_version`). Плюс инфраструктурные (как в
-tasks): `init(opt InitArgs)` (testnet-оверрайды index/NNS-root, на mainnet — trap) и `bootstrap()` —
-одноразовый идемпотентный фетч мастер-Schnorr-ключа (`schnorr_public_key`) после деплоя (sync `init` не
-может, таймеры запрещены).
+**Update:** `create_collection` · `ready` · `recipient_cancel` · `vote` · `request_signature` ·
+**`push_root`**.
+**Query:** `get_collection` · `get_resolver` · `get_signature` · `get_logic_version`.
+Плюс инфраструктурные (как в tasks): `init(opt InitArgs)` (testnet-оверрайды index/NNS-root, на
+mainnet — trap) и `bootstrap()` — одноразовый идемпотентный фетч мастер-Schnorr-ключа
+(`schnorr_public_key`) после деплоя (sync `init` не может, таймеры запрещены).
+
+`get_signature(collection)` — свободный `query`: подпись сбора, произведённая один раз. Именно им
+амортизация `s/N` становится фактом — второй и последующие эскроу читают байты здесь, а не покупают
+подпись заново.
+
+**`push_root(cert)` — оплаченный пуш корня индекса** (фронтит релеер за `ROOT_PRICE`). Канистра
+аутентифицирует сертификат индекса (две BLS-пары: подпись индекса + делегация сабнета) против NNS
+root key и кладёт `combined_root` в кеш `ROOTS` (глубина `ROOT_CACHE = 4`). Дальше **всякий** пруф
+рождения/репутации — обход хеш-дерева против любого корня из кеша, без пар.
+
+Зачем расщепление: BLS-пары не влезают в бюджет `inspect_message` (200M инструкций) — прямой ingress
+`create_collection` с сертификатом отбивался бы `CanisterInstructionLimitExceeded`, то есть **валидная**
+материализация не проходит вовсе; а бесплатной на `update` эта проверка была бы реплицируемой парой на
+любую анонимную строку байт. Платный разовый пуш делает дорогим ровно один шаг и оставляет дешёвыми
+все per-caller пути (`cost.md §6` #2). Оплата принимается **до** пар, на кривом сертификате не
+возвращается (`01-standards §Тесты 4`). Кеш из нескольких корней нужен потому, что корень индекса
+двигается на каждой вписи: свидетель, собранный против актуального на тот момент корня, обязан
+пройти, пока не приедет следующий `push_root`. Повторный пуш того же корня освежает позицию, а не
+растит кеш (иначе реплей вытеснил бы все живые корни). Полностью совпадает с эталоном
+(`conditional-tasks`) — это инвариант харнесса, а не деталь одной игры.
 
 Query состояния игры **не сертифицированы** (`+witness` снят по всему проекту): доверие в Crown течёт через
 threshold-подпись резолвера (проверяется on-chain) и сертифицированные пруфы **индекса** (книга/рождения),
@@ -153,9 +189,13 @@ threshold-подпись резолвера (проверяется on-chain) и
 валидность — в `inspect_message`.
 
 **Граница (`inspect_message`, харнесс §6):** каждый меняющий состояние вызов доказывает применимость до
-раунда — `create_collection` с пруфом рождения материализует (дорогая BLS не идёт реплицируемо на мусор;
-без пруфа — чистое эхо, ноль записи), `ready`/`recipient_cancel` — подписант ≡ получатель + состояние,
-`vote` пруф веса + порог. Обречённое отбивается не-реплицируемо; `update` авторитетен.
+раунда — `create_collection` пруфом рождения **против кешированного корня** (обход хеш-дерева, O(log n);
+BLS сюда не идёт — она на оплаченном `push_root`) и материализует (без пруфа — чистое эхо, ноль записи),
+`ready`/`recipient_cancel` — подписант ≡ получатель + состояние, `vote` пруф веса + порог (тоже против
+кеша). Первым режется размер аргумента (`MAX_ARG_BYTES = 8 KiB`). `bootstrap` допускается только пока
+мастер-ключ не взят. `request_signature` и `push_root` — relay-fronted (inter-canister), границу не
+проходят; прямой ingress на них не декодируется как один `text` и отбивается. Обречённое отбивается
+не-реплицируемо; `update` авторитетен.
 
 ## Терминальные исходы: деньги / комиссия / репутация
 

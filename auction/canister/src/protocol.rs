@@ -53,17 +53,40 @@ pub fn lot_id(auction_id: &[u8; 32], text_hash: &[u8; 32]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Per-entry settlement scope: `entry_id = sha256(lot_id ‖ donor ‖ u64le(nonce))`.
+/// Per-entry settlement scope:
+/// `entry_id = sha256(lot_id ‖ donor ‖ u64le(nonce) ‖ u64le(gross) ‖ i64le(deadline))`.
+///
 /// The resolver lives at the **entry** — the leaf where a settle/cancel decision
 /// is actually made — so `resolver = key([entry_id])` names exactly one escrow and
-/// a verdict can never be redeemed against a sibling entry. `(donor, nonce)` is
-/// unique per escrow (a duplicate birth is rejected), so `entry_id` is unique per
-/// entry. Completes the scope hierarchy `auction_id → lot_id → entry_id`.
-pub fn entry_id(lot_id: &[u8; 32], donor: &[u8; 32], nonce: u64) -> [u8; 32] {
+/// a verdict can never be redeemed against a sibling entry.
+///
+/// **It must commit every field of the escrow's salt** (harness §4: a 1:1 scope
+/// commits `gross`/`deadline`), and `gross`/`deadline` are exactly the two the
+/// address derives from but a `(lot, donor, nonce)` triple does not. Without them
+/// one donor could fund two escrows — same nonce, different amount or deadline
+/// (`validate::deadline_ok` only bounds it from below) — that derive to two
+/// distinct addresses and therefore both pass `DuplicateEscrow`, yet share one
+/// `entry_id`, one resolver and one memoized verdict. A `return_entry` on the
+/// small twin then yields a `Cancel` signature redeemable against the large one:
+/// the donor takes the money back after the work was done. Committing them makes
+/// the twins two scopes, so each buys its own verdict.
+///
+/// No derivation cycle: `gross`/`deadline` are fields the caller presents, and the
+/// escrow address depends on them *through* the resolver — never the reverse.
+/// Completes the scope hierarchy `auction_id → lot_id → entry_id`.
+pub fn entry_id(
+    lot_id: &[u8; 32],
+    donor: &[u8; 32],
+    nonce: u64,
+    gross: u64,
+    deadline: i64,
+) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(lot_id);
     h.update(donor);
     h.update(nonce.to_le_bytes());
+    h.update(gross.to_le_bytes());
+    h.update(deadline.to_le_bytes());
     h.finalize().into()
 }
 
@@ -203,19 +226,52 @@ mod tests {
     #[test]
     fn entry_id_is_a_unique_leaf_scope_per_entry() {
         let lot = [7u8; 32];
-        let base = entry_id(&lot, &[1; 32], 5);
-        // Byte layout: sha256(lot ‖ donor ‖ u64le(nonce)).
+        let base = entry_id(&lot, &[1; 32], 5, 1_000_000, 1_800_000_000);
+        // Byte layout: sha256(lot ‖ donor ‖ u64le(nonce) ‖ u64le(gross) ‖ i64le(deadline)).
         let mut h = Sha256::new();
         h.update(lot);
         h.update([1u8; 32]);
         h.update(5u64.to_le_bytes());
+        h.update(1_000_000u64.to_le_bytes());
+        h.update(1_800_000_000i64.to_le_bytes());
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(base, expected);
         // Every field moves the entry scope → distinct resolvers, no cross-entry
         // verdict redemption within a lot.
-        assert_ne!(base, entry_id(&[8; 32], &[1; 32], 5)); // different lot
-        assert_ne!(base, entry_id(&lot, &[2; 32], 5)); // different donor
-        assert_ne!(base, entry_id(&lot, &[1; 32], 6)); // different nonce
+        assert_ne!(
+            base,
+            entry_id(&[8; 32], &[1; 32], 5, 1_000_000, 1_800_000_000)
+        );
+        assert_ne!(base, entry_id(&lot, &[2; 32], 5, 1_000_000, 1_800_000_000));
+        assert_ne!(base, entry_id(&lot, &[1; 32], 6, 1_000_000, 1_800_000_000));
+    }
+
+    /// The entry scope must commit **every** field the escrow address derives
+    /// from, or two escrows share one resolver and one verdict.
+    ///
+    /// `gross` and `deadline` are the two that a `(lot, donor, nonce)` triple
+    /// misses while `crown_games_common::address::escrow_address` uses them. Twin
+    /// escrows built on them derive to two distinct addresses — so both clear the
+    /// `DuplicateEscrow` check, which compares addresses — and would otherwise
+    /// land in the same scope: a `Cancel` bought for the cheap twin redeems
+    /// against the expensive one.
+    #[test]
+    fn twin_escrows_differing_only_in_gross_or_deadline_are_distinct_scopes() {
+        let lot = [7u8; 32];
+        let donor = [1u8; 32];
+        let base = entry_id(&lot, &donor, 5, 1_000_000, 1_800_000_000);
+        // Same donor, same nonce, same lot — only the amount differs.
+        assert_ne!(
+            base,
+            entry_id(&lot, &donor, 5, 1, 1_800_000_000),
+            "a cheaper twin must not share the expensive entry's resolver"
+        );
+        // Same again — only the deadline differs (bounded from below only).
+        assert_ne!(
+            base,
+            entry_id(&lot, &donor, 5, 1_000_000, 1_800_000_001),
+            "a deadline+1 twin must not share the entry's resolver"
+        );
     }
 
     #[test]

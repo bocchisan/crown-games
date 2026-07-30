@@ -8,7 +8,7 @@
 //! already-accepted, entry-not-returned, and pick-must-be-an-accepted-lot.
 //! Host-testable pure operations under thin `ic_cdk` wrappers.
 
-use auction_logic::{step, Action, Auction, Known, State, StepError, Vote};
+use auction_logic::{step, Action, ActionKind, Auction, Known, State, StepError, Vote};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -45,6 +45,11 @@ struct StoredAuction {
     min_entry: u64,
     lots: Vec<StoredLot>,
 }
+
+// The verdict signature store and its claim-before-await discipline live in
+// `crown_games_common::signing` — non-negativity invariant #5, one mechanism
+// for every game rather than three byte-identical copies (`P7.6`).
+pub use crown_games_common::signing::SignedVerdict;
 
 thread_local! {
     static AUCTIONS: RefCell<BTreeMap<[u8; 32], StoredAuction>> =
@@ -313,7 +318,11 @@ pub fn ready(auction_id: &[u8; 32], signer: &[u8; 32], now: u64) -> Result<State
 /// checks pass here; `add_vote` stays the authoritative gate (it advances time
 /// and mutates). The stored state suffices: `Voting` is only ever left for
 /// `Done` by time, never entered, so an effective `Voting` implies a stored one.
-pub fn vote_admits(auction_id: &[u8; 32], voter: &[u8; 32], v_max: usize) -> Result<(), StateError> {
+pub fn vote_admits(
+    auction_id: &[u8; 32],
+    voter: &[u8; 32],
+    v_max: usize,
+) -> Result<(), StateError> {
     AUCTIONS.with_borrow(|a| {
         let s = a.get(auction_id).ok_or(StateError::NotFound)?;
         if s.auction.votes.len() >= v_max {
@@ -389,6 +398,38 @@ pub fn recipient(auction_id: &[u8; 32]) -> Option<[u8; 32]> {
     AUCTIONS.with_borrow(|a| a.get(auction_id).map(|s| s.recipient))
 }
 
+/// Time-free boundary pre-check for a recipient action (harness §6), the twin of
+/// [`vote_admits`]: unknown auction, wrong signer, or a stored state that admits
+/// no action of this kind.
+///
+/// Takes an [`ActionKind`], not an `Action`: `return_lot`/`return_entry` carry a
+/// winner flag this canister reads from stored state, and the boundary must not
+/// guess it — a kind is admitted if *some* flag would be. Together with the
+/// time-free reading that makes the check conservative on both axes, which is
+/// what `State::admits` documents and an exhaustive machine test pins.
+///
+/// A strict subset of the per-action state ops' rejections, which stay
+/// authoritative. Without it the boundary passed every action from the right
+/// signer, and the doomed ones were executed replicated at the canister's
+/// expense — free for the sender, and unbounded, since the signed half of a
+/// request carries no nonce and replays.
+pub fn action_admits(
+    auction_id: &[u8; 32],
+    signer: &[u8; 32],
+    kind: ActionKind,
+) -> Result<(), StateError> {
+    AUCTIONS.with_borrow(|a| {
+        let s = a.get(auction_id).ok_or(StateError::NotFound)?;
+        if s.recipient != *signer {
+            return Err(StateError::NotRecipient);
+        }
+        if !s.auction.state.admits(kind) {
+            return Err(StateError::Step(StepError::InvalidTransition));
+        }
+        Ok(())
+    })
+}
+
 /// The auction's state, with accrued time transitions applied at `now`.
 pub fn auction_state(auction_id: &[u8; 32], now: u64) -> Option<State> {
     AUCTIONS.with_borrow_mut(|a| {
@@ -455,7 +496,13 @@ mod tests {
 
     fn reset() {
         AUCTIONS.with_borrow_mut(BTreeMap::clear);
+        crown_games_common::signing::reset_for_test();
     }
+
+    // The signature store's own behaviour — repeat served free, one claim at a
+    // time, an aborted signing left retriable — is tested once, in
+    // `crown_games_common::signing`. Re-testing it per game re-tested one
+    // mechanism three times and told us nothing about this game (`P7.6`).
 
     fn setup(id: [u8; 32], recipient: [u8; 32]) {
         materialize(id, fresh_auction(), recipient, 0).unwrap();
@@ -471,6 +518,14 @@ mod tests {
     ) -> Result<(), StateError> {
         // A distinct leaf scope per escrow (in production `entry_id`); here the
         // escrow bytes stand in, so it is unique per entry.
+        //
+        // That substitution is why these tests stayed green while `entry_id` was
+        // collidable: uniqueness is assumed here, not derived. The property that
+        // one escrow gets one scope belongs to the derivation and is tested where
+        // it lives — `protocol::twin_escrows_differing_only_in_gross_or_deadline_
+        // are_distinct_scopes`. Do not "strengthen" this fixture by re-deriving
+        // `entry_id`: it would re-test `protocol` and still tell us nothing about
+        // `state`, which stores whatever scope it is handed.
         add_entry(id, text, lot, escrow, escrow, now)
     }
 
@@ -812,6 +867,95 @@ mod tests {
         );
     }
 
+    /// The boundary must refuse a doomed recipient action, not leave it to the
+    /// update — otherwise one signed `ready` (or `cancel`, or `pick`) is a flood
+    /// template executed replicated at the canister's expense.
+    #[test]
+    fn action_admits_refuses_what_the_state_will_refuse() {
+        reset();
+        let id = [1u8; 32];
+        let recipient = [9u8; 32];
+
+        assert_eq!(
+            action_admits(&id, &recipient, ActionKind::Ready),
+            Err(StateError::NotFound)
+        );
+
+        materialize(id, fresh_auction(), recipient, 1).unwrap();
+        assert_eq!(
+            action_admits(&id, &[8u8; 32], ActionKind::CancelAuction),
+            Err(StateError::NotRecipient)
+        );
+
+        // `Bidding` runs the auction but has no `ready` and no vote.
+        for k in [
+            ActionKind::AcceptLot,
+            ActionKind::ReturnLot,
+            ActionKind::ReturnEntry,
+            ActionKind::PickWinner,
+            ActionKind::CancelAuction,
+        ] {
+            assert_eq!(
+                action_admits(&id, &recipient, k),
+                Ok(()),
+                "{k:?} in Bidding"
+            );
+        }
+        for k in [ActionKind::Ready, ActionKind::Vote] {
+            assert_eq!(
+                action_admits(&id, &recipient, k),
+                Err(StateError::Step(StepError::InvalidTransition)),
+                "{k:?} must be refused while Bidding"
+            );
+        }
+
+        // `Done` is absorbing: nothing at all, ever.
+        cancel_auction(&id, &recipient, CREATED).unwrap();
+        for k in [
+            ActionKind::AcceptLot,
+            ActionKind::ReturnLot,
+            ActionKind::ReturnEntry,
+            ActionKind::PickWinner,
+            ActionKind::CancelAuction,
+            ActionKind::Ready,
+            ActionKind::Vote,
+        ] {
+            assert_eq!(
+                action_admits(&id, &recipient, k),
+                Err(StateError::Step(StepError::InvalidTransition)),
+                "{k:?} must be refused on a done auction"
+            );
+        }
+    }
+
+    /// Every boundary rejection must be one the update would also make, or a
+    /// legitimate call is dropped for free and reads as a refusal without cause.
+    /// `ready` is the interesting one: doomed in `Bidding`, live in `Performing`.
+    #[test]
+    fn action_admits_never_refuses_what_the_update_would_accept() {
+        reset();
+        let id = [1u8; 32];
+        let recipient = [9u8; 32];
+        let lot = [3u8; 32];
+        materialize(id, fresh_auction(), recipient, 1).unwrap();
+
+        assert_eq!(
+            action_admits(&id, &recipient, ActionKind::PickWinner),
+            Ok(())
+        );
+        // A lot must exist and be accepted before it can win; drive the auction
+        // through the real ops so the states are the ones the update produces.
+        accept_lot(&id, &recipient, &lot, CREATED).ok();
+        if pick_winner(&id, &recipient, &lot, CREATED).is_ok() {
+            // Now `Performing`: `ready` becomes admissible and applicable.
+            assert_eq!(action_admits(&id, &recipient, ActionKind::Ready), Ok(()));
+            assert!(
+                ready(&id, &recipient, CREATED).is_ok(),
+                "update refused `ready` the boundary admitted"
+            );
+        }
+    }
+
     #[test]
     fn vote_admits_is_a_subset_of_add_vote_and_needs_no_weight_proof() {
         reset();
@@ -837,6 +981,9 @@ mod tests {
             Err(StateError::Step(StepError::DuplicateVoter))
         );
         // Cap is checked before the duplicate scan (matching add_vote's order).
-        assert_eq!(vote_admits(&id, &[2; 32], 1), Err(StateError::VoteCapReached));
+        assert_eq!(
+            vote_admits(&id, &[2; 32], 1),
+            Err(StateError::VoteCapReached)
+        );
     }
 }

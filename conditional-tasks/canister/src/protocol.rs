@@ -87,21 +87,8 @@ pub fn vote_message(chain: &str, canister: &str, task_bs58: &str, choice: &str) 
     )
 }
 
-/// `set-profile` message (recipient signs) — a strictly increasing `counter`.
-#[allow(clippy::too_many_arguments)]
-pub fn profile_message(
-    chain: &str,
-    canister: &str,
-    recipient_bs58: &str,
-    min_gross: u64,
-    min_reputation: u128,
-    enabled: bool,
-    counter: u64,
-) -> String {
-    format!(
-        "{DOMAIN}\naction: set-profile\nchain: {chain}\ncanister: {canister}\nrecipient: {recipient_bs58}\nmin_gross: {min_gross}\nmin_reputation: {min_reputation}\nenabled: {enabled}\ncounter: {counter}"
-    )
-}
+// There is no `set-profile` message: the recipient's acceptance terms are a
+// client-side filter, not canister state (`P7.14`, `state.rs`).
 
 // The verdict message (`domain ‖ program_id(32) ‖ u8(outcome)`) and the Ed25519
 // wallet-signature check are the same across every `two-outcome` game — they live
@@ -321,10 +308,6 @@ mod tests {
             vote_message("devnet", "aaaaa-aa", "T", "done"),
             "crown:conditional-tasks:v1\naction: vote\nchain: devnet\ncanister: aaaaa-aa\ntask: T\nchoice: done"
         );
-        assert_eq!(
-            profile_message("devnet", "aaaaa-aa", "R", 1_860_000, 0, true, 5),
-            "crown:conditional-tasks:v1\naction: set-profile\nchain: devnet\ncanister: aaaaa-aa\nrecipient: R\nmin_gross: 1860000\nmin_reputation: 0\nenabled: true\ncounter: 5"
-        );
     }
 
     #[test]
@@ -381,5 +364,28 @@ mod tests {
         let cancel = verdict_message("crown:two-outcome:devnet", &program, 1);
         assert_eq!(cancel[..cancel.len() - 1], m[..m.len() - 1]);
         assert_ne!(cancel, m);
+    }
+
+    /// The one thing the framing tests in `crown_games_common::request` cannot
+    /// say: that *this game's* messages survive it. Everything else about the
+    /// wire format — the separator, the auth extraction, tampering, a wrong
+    /// signer — is one security boundary and is tested once, there.
+    #[test]
+    fn a_real_register_message_round_trips_the_shared_wire_format() {
+        use crown_games_common::request::parse;
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let msg = register_message("devnet", "aaaaa-aa", "T", "ab", 3600);
+        let pk = bs58::encode(sk.verifying_key().to_bytes()).into_string();
+        let sig = bs58::encode(sk.sign(msg.as_bytes()).to_bytes()).into_string();
+        let text = format!("{msg}\n---\npubkey: {pk}\nsignature: {sig}\ngross: 1860000\nnonce: 9");
+
+        let req = parse(&text).expect("a real register message parses");
+        assert_eq!(req.pubkey, sk.verifying_key().to_bytes());
+        assert_eq!(req.signed("action"), Some("register"));
+        assert_eq!(req.signed("duration"), Some("3600"));
+        // Registration fields ride unsigned and must stay out of the signed map —
+        // they are cross-checked against the birth proof, never trusted here.
+        assert_eq!(req.extra("gross"), Some("1860000"));
+        assert_eq!(req.signed("gross"), None);
     }
 }

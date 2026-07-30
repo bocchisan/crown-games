@@ -1,17 +1,26 @@
 # conditional-funding — devnet-профиль.
 crown_index        = "aaaaa-aa"           # principal crown-indexer
-threshold_key      = "dfx_test_key"
+# Имя threshold-ключа — свойство **окружения**, не признак «настоящести»: `key_1`
+# и локально (сеть dfx сама работает на PocketIC), и на IC mainnet; `test_key_1` —
+# только на тестовом сабнете IC. Стоявший здесь `dfx_test_key` не заводится ни в
+# одном из трёх, и именно он, а не отсутствие возможности, был «блокером» подписи.
+threshold_key      = "key_1"
 voting_period      = 120                   # devnet; в прообразе collection_id
 approval_threshold = 5000                  # строгое большинство
 quorum_weight      = 150_000
+min_gross          = 250_000  # devnet: чуть выше пыльного флора индекса ($0.20), чтобы прогон стоил центы; экономический флор — в mainnet-профиле (cost.md §5,§6)
 sign_price         = 26_200_000_000        # цена подписи сбора (harness §5; ≤ релейного SIGN_PRICE), амортизируется на N вкладов
+root_price         = 1_000_000_000         # цена обновления корня индекса (BLS-пары сертификата); cost-gate P8
 slot_ms            = 400                    # 1000/SLOTS_PER_SECOND (SLOTS_PER_SECOND=2.5)
-genesis_slot       = 0                      # якорь slot→unix (placeholder до F5 devnet)
-genesis_unix       = 0                      # якорь slot→unix (placeholder до F5 devnet)
+# Якорь slot→unix — сетевая константа devnet, замерена на F5 (`getBlockTime`
+# финализованного слота). Не плейсхолдер: с нулём `created_at` уезжает в 1975 год,
+# окно сбора закрыто до первой материализации, и отказ выглядит беспричинным.
+genesis_slot       = 479_731_554
+genesis_unix       = 1_785_326_212
 
 [[chain]]
 id         = "devnet"
-factory    = "PLACEHOLDER_factory_two_outcome"
+factory    = "BGVQrwSwkFQspL69DjGBFgKSgL6rutPqgcgEskmi8A4y"  # two-outcome на devnet
 domain     = "crown:two-outcome:devnet"
 fee_bps    = 300
-fee_wallet = "PLACEHOLDER_fee_wallet"
+fee_wallet = "FS6ZNuPxXqWSGzwXEQpfoxikDksbEzmrXGZDFXmFj6vS"  # devnet-кошелёк комиссии

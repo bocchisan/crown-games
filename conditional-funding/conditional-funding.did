@@ -2,9 +2,12 @@
 type CollectionResult = variant {
   Advanced : CollectionStateView;
   Underpaid;
+  GrossBelowFloor;
   DurationOutOfRange;
   // A `create` without a birth proof: derivation echo only, zero writes.
   Derived : record { resolver : text; collection : text };
+  // A certified index root was authenticated and cached.
+  RootPushed;
   VoteCapReached;
   CollectionIdMismatch;
   InvalidTransition;
@@ -18,10 +21,13 @@ type CollectionResult = variant {
   FieldMismatch;
   NotDecided;
   Materialized;
+  // A sibling call is already signing this scope — free, no charge. Retry and
+  // the produced signature is served from store.
+  SignInFlight;
   SignFailed;
   DuplicateVoter;
   // A verdict signature: `outcome` (settle=0/refund=1) + the schnorr signature.
-  Signed : record { signature : blob; outcome : nat8 };
+  Signed : SignatureView;
   CreatedAtOverflow;
   WrongTarget;
   DeadlineTooTight;
@@ -39,21 +45,41 @@ type CollectionStateView = variant {
 // Deploy-time overrides (testnet): the index principal and the NNS root key
 // (PocketIC / a test IC differ from mainnet). Barred on mainnet.
 type InitArgs = record { nns_root_key : blob; index : principal };
+// A produced verdict signature, for `get_signature`.
+type SignatureView = record { signature : blob; outcome : nat8 };
 service : (opt InitArgs) -> {
   // Fetch and cache the threshold master public key (one-time, idempotent). Must
   // run after deploy before donors can query resolvers. `init` cannot (it is
   // sync) and timers are barred, so this is an explicit setup call.
   bootstrap : () -> (CollectionResult);
-  // Lazy creation (recipient-signed). Derive `collection_id` (recompute from the
-  // presented fields, match the signed `collection`) and its resolver. If a birth
-  // proof of the first funded contribution is attached, verify it at the derived
-  // escrow address and materialize the `Funding` collection, fixing `created_at`
-  // from the birth slot. Without a birth proof nothing is written (a derivation
-  // echo). `ready`/`recipient_cancel` never materialize.
+  // Lazy creation (recipient-signed). Admit the request (via `admit_create_collection`,
+  // also run at the boundary so a bogus cert never reaches replicated execution),
+  // then perform the one thing a boundary check must not: the write. A `create`
+  // without a birth proof echoes the derivation (`Derived`, zero writes); a valid
+  // birth proof materializes the `Funding` collection. `ready`/`recipient_cancel`
+  // never materialize.
   create_collection : (text) -> (CollectionResult);
   get_collection : (text) -> (opt CollectionStateView) query;
   get_logic_version : () -> (nat32) query;
   get_resolver : (text) -> (opt text) query;
+  // The verdict signature already produced for a collection, if any. Free query —
+  // every escrow after the first reads the bytes here instead of paying the relay
+  // to re-request a `SIGN_PRICE` pull for a signature that already exists.
+  get_signature : (text) -> (opt SignatureView) query;
+  // Paid pull (fronted by the relay for `ROOT_PRICE`): authenticate a fresh index
+  // root and cache it, so the anonymous boundary can admit birth/reputation
+  // witnesses with a hash-tree walk alone.
+  // 
+  // The certificate costs two BLS pairings (the index's signature plus the subnet
+  // delegation) — far past the 200M-instruction budget of `inspect_message`, so it
+  // cannot live there; and free on `update` it would be a replicated pairing for
+  // any anonymous byte string. Charging it makes the one expensive step the paid
+  // one and keeps every per-caller path cheap (`cost.md §6` #2).
+  // 
+  // Payment is accepted **before** the pairings, and a bogus certificate is not
+  // refunded: fund-then-fail must not be cheaper than the work it triggers
+  // (`01-standards §Тесты 4`).
+  push_root : (blob) -> (CollectionResult);
   ready : (text) -> (CollectionResult);
   recipient_cancel : (text) -> (CollectionResult);
   // Paid pull (fronted by the relay for `SIGN_PRICE`): the per-collection resolver
@@ -63,9 +89,9 @@ service : (opt InitArgs) -> {
   // Payment is accepted **before** `sign_with_schnorr`; a not-yet-`Decided`
   // collection is refused without charge.
   request_signature : (text, text) -> (CollectionResult);
-  // A reputation-weighted vote. Validity (signature + weight proof ≥
-  // `MIN_VOTE_WEIGHT`) is gated in `inspect_message` for free; here the weight is
-  // re-proven, the `(collection_id, voter)` dedup + `V_MAX` cap applied, and the
-  // vote recorded. Weight = the voter's reputation to the collection's recipient.
+  // A reputation-weighted vote. Admissibility (signature + weight proof ≥
+  // `MIN_VOTE_WEIGHT`) is gated at the boundary via `admit_vote`; here the same
+  // check runs authoritatively, then the `(collection_id, voter)` dedup + `V_MAX`
+  // cap apply. Weight = the voter's reputation to the collection's recipient.
   vote : (text) -> (CollectionResult);
 }

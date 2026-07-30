@@ -6,6 +6,7 @@
 //! `[u8; 32]`; a placeholder decodes to zero (a hard error on the frozen
 //! `mainnet` profile, along with a zero slot→time anchor).
 
+use crown_games_common::config_bake::{addr as decode_addr, str_of, u128_of};
 use std::{env, fs, path::Path};
 
 fn main() {
@@ -25,13 +26,19 @@ fn main() {
     let perform_window = u128_of(&text, "perform_window") as u64;
     let min_entry = u128_of(&text, "min_entry") as u64;
     let sign_price = u128_of(&text, "sign_price");
+    let root_price = u128_of(&text, "root_price");
     let fee_bps = u128_of(&text, "fee_bps") as u16;
-    let fee_wallet = addr(&str_of(&text, "fee_wallet"), "fee_wallet", strict);
+    let fee_wallet = decode_addr(
+        &str_of(&text, "fee_wallet"),
+        "fee_wallet",
+        strict,
+        "auction",
+    );
     let chain_id = str_of(&text, "id");
-    let factory = addr(&str_of(&text, "factory"), "factory", strict);
+    let factory = decode_addr(&str_of(&text, "factory"), "factory", strict, "auction");
     let domain = str_of(&text, "domain");
     // slot→time anchor (spec §Состояния: "slot→time by a pinned SLOTS_PER_SECOND,
-    // as in conditional-funding"). Placeholder until A5(devnet)/P8(mainnet).
+    // as in conditional-funding"). Measured on devnet at A5; mainnet pinned at P8.
     let slot_ms = u128_of(&text, "slot_ms") as u64;
     let genesis_slot = u128_of(&text, "genesis_slot") as u64;
     let genesis_unix = u128_of(&text, "genesis_unix") as u64;
@@ -54,6 +61,8 @@ fn main() {
          pub const MIN_ENTRY: u64 = {min_entry};\n\
          /// Price charged for a verdict signature (<= relay SIGN_PRICE).\n\
          pub const SIGN_PRICE: u128 = {sign_price};\n\
+         /// Price charged for a certified-root refresh (covers the BLS pairings).\n\
+         pub const ROOT_PRICE: u128 = {root_price};\n\
          pub const FEE_BPS: u16 = {fee_bps};\n\
          /// Fee wallet (Solana address). Zero if a placeholder.\n\
          pub const FEE_WALLET: [u8; 32] = {fee_wallet:?};\n\
@@ -65,45 +74,11 @@ fn main() {
          pub const DOMAIN: &str = {domain:?};\n\
          /// Milliseconds per Solana slot (`1000 / SLOTS_PER_SECOND`).\n\
          pub const SLOT_MS: u64 = {slot_ms};\n\
-         /// Anchor slot for the slot→time conversion (placeholder until A5/P8).\n\
+         /// Anchor slot for slot→time. Measured on devnet (A5/F5); mainnet pinned at P8.\n\
          pub const GENESIS_SLOT: u64 = {genesis_slot};\n\
-         /// Anchor unix time (seconds) for slot→time (placeholder until A5/P8).\n\
+         /// Anchor unix time (seconds) for slot→time. Measured on devnet (A5/F5).\n\
          pub const GENESIS_UNIX: u64 = {genesis_unix};\n",
     );
     let dst = Path::new(&env::var("OUT_DIR").unwrap()).join("config.rs");
     fs::write(&dst, out).unwrap();
-}
-
-fn str_of(text: &str, key: &str) -> String {
-    text.lines()
-        .find_map(|l| {
-            let rest = l.trim().strip_prefix(key)?.trim_start().strip_prefix('=')?;
-            let rest = rest.split('#').next().unwrap_or(rest).trim();
-            Some(rest.trim_matches('"').to_string())
-        })
-        .unwrap_or_else(|| panic!("missing `{key}` in config"))
-}
-
-fn u128_of(text: &str, key: &str) -> u128 {
-    let raw = str_of(text, key);
-    raw.replace('_', "")
-        .parse()
-        .unwrap_or_else(|_| panic!("`{key}` = `{raw}` is not an integer"))
-}
-
-fn addr(s: &str, what: &str, strict: bool) -> [u8; 32] {
-    match bs58::decode(s).into_vec() {
-        Ok(v) if v.len() == 32 => {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(&v);
-            a
-        }
-        _ => {
-            if strict {
-                panic!("`{what}` = `{s}` is not a valid address (mainnet requires real addresses)");
-            }
-            println!("cargo:warning=auction: `{what}` is a placeholder (`{s}`) — baked as unset");
-            [0u8; 32]
-        }
-    }
 }

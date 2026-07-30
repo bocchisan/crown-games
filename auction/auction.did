@@ -8,6 +8,8 @@ type AuctionResult = variant {
   DuplicateEscrow;
   DurationOutOfRange;
   Derived : record { auction : text };
+  // A certified index root was authenticated and cached.
+  RootPushed;
   VoteCapReached;
   InvalidTransition;
   NotFound;
@@ -25,9 +27,12 @@ type AuctionResult = variant {
   LotNotAccepted;
   Materialized;
   LotAlreadyAccepted;
+  // A sibling call is already signing this entry scope — free, no charge.
+  // Retry and the produced signature is served from store.
+  SignInFlight;
   SignFailed;
   DuplicateVoter;
-  Signed : record { signature : blob; outcome : nat8 };
+  Signed : SignatureView;
   CreatedAtOverflow;
   PerformWindowOutOfRange;
   Registered;
@@ -56,29 +61,61 @@ type LotView = record {
   returned : bool;
   text_hash : text;
 };
+// A produced verdict signature, for `get_signature`.
+type SignatureView = record { signature : blob; outcome : nat8 };
 service : (opt InitArgs) -> {
   accept_lot : (text) -> (AuctionResult);
   // One-time idempotent fetch of the threshold master public key.
   bootstrap : () -> (AuctionResult);
   cancel_auction : (text) -> (AuctionResult);
-  // Pure derivation echo (recipient-signed, zero writes, permissionless):
-  // recompute `auction_id` from the presented fields + config snapshot and confirm
-  // it matches the signed `auction`. Materialization happens later, on the first
-  // confirmed entry (`register_entry`).
-  create_auction : (text) -> (AuctionResult);
   get_auction : (text) -> (opt AuctionStateView) query;
+  // Pure derivation echo (recipient-signed, zero writes, permissionless):
+  // `admit_create` recomputes `auction_id` and confirms it matches the signed
+  // `auction`; here we just echo the derived id. Materialization happens later, on
+  // the first confirmed entry (`register_entry`).
+  //
+  // A `query`, and that is the whole point (`P7.15`, spec §Таблица переходов ¹).
+  // It reads no mutable state and writes none, so as an `update` it made the
+  // entire subnet recompute — replicated, at this canister's expense — what one
+  // node can compute. Worse, it was the one state-changing entry point whose
+  // admissibility depended on nothing external: a fresh keypair signs its own
+  // message and `auction_id` recomputes from its own fields, so the boundary
+  // admitted it *always*. No dedup, no cap, no cost to the caller. The reference
+  // game has no such method at all — `task_id` is derived client-side and the
+  // first touch is already a birth-proved `register_task`.
+  get_auction_id : (text) -> (AuctionResult) query;
   get_logic_version : () -> (nat32) query;
   get_lot : (text, text) -> (opt LotView) query;
   // The resolver a donor bakes into their escrow for entry `(lot, donor, nonce)`:
   // `key([entry_id])`, `entry_id = sha256(lot ‖ donor ‖ nonce)`. Per-entry, so the
   // verdict signed under it settles only this one escrow. Free, pure derivation.
-  get_resolver : (text, text, nat64) -> (opt text) query;
+  get_resolver : (text, text, nat64, nat64, int64) -> (opt text) query;
+  // The verdict signature already produced for an entry, if any. Free query — a
+  // claimer that lost the race, or one that simply needs the bytes again, reads
+  // them here instead of paying the relay to re-request a `SIGN_PRICE` pull.
+  get_signature : (text, text, text) -> (opt SignatureView) query;
   // The recipient names the winning lot (accepted, non-returned) → `Performing`.
   pick_winner : (text) -> (AuctionResult);
+  // Paid pull (fronted by the relay for `ROOT_PRICE`): authenticate a fresh index
+  // root and cache it, so the anonymous boundary can admit birth/reputation
+  // witnesses with a hash-tree walk alone.
+  // 
+  // The certificate costs two BLS pairings (the index's signature plus the subnet
+  // delegation) — far past the 200M-instruction budget of `inspect_message`, so it
+  // cannot live there; and free on `update` it would be a replicated pairing for
+  // any anonymous byte string. Charging it makes the one expensive step the paid
+  // one and keeps every per-caller path cheap (`cost.md §6` #2).
+  // 
+  // Payment is accepted **before** the pairings, and a bogus certificate is not
+  // refunded: fund-then-fail must not be cheaper than the work it triggers
+  // (`01-standards §Тесты 4`).
+  push_root : (blob) -> (AuctionResult);
   ready : (text) -> (AuctionResult);
-  // Materialization carrier (donor-signed): verify the contribution's birth at the
-  // derived escrow, materialize the auction on the first confirmed entry, and add
-  // the entry to its lot.
+  // Materialization carrier (donor-signed): the boundary-shared `admit_register_entry`
+  // verifies the contribution's birth at the derived escrow (the time-free prefix,
+  // run at the boundary and re-run here authoritatively); this body performs only
+  // the time/state-dependent tail — materialize on the first confirmed entry (fixing
+  // `created_at`), gate the entry against the fixed timeline, and add it to its lot.
   register_entry : (text) -> (AuctionResult);
   // Paid pull: the three-stage resolution → one signature under the escrow's own
   // leaf scope (`key([entry_id])`). In `Bidding` (winner not yet picked) there is
@@ -89,8 +126,8 @@ service : (opt InitArgs) -> {
   return_entry : (text) -> (AuctionResult);
   return_lot : (text) -> (AuctionResult);
   // A reputation-weighted vote on the winner lot (`Voting`). Validity (signature +
-  // weight proof ≥ `MIN_VOTE_WEIGHT`) is gated in `inspect_message` for free; here
-  // the weight is re-proven and recorded (dedup + `V_MAX` in the machine/state).
-  // Weight = the voter's reputation to the auction's recipient.
+  // weight proof ≥ `MIN_VOTE_WEIGHT`) is gated at the boundary via `admit_vote`; here
+  // the same check runs authoritatively, then the dedup + `V_MAX` cap apply in the
+  // machine/state. Weight = the voter's reputation to the auction's recipient.
   vote : (text) -> (AuctionResult);
 }

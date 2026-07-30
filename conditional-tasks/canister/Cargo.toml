@@ -19,7 +19,9 @@ hex = "0.4"             # hex(text_hash) в register-сообщении
 ic-cdk-management-canister = "0.1"  # schnorr_public_key: bootstrap мастер-ключа резолвера
 
 [build-dependencies]
-bs58 = "0.5"  # base58 → [u8;32] адресов (fee_wallet, factory) из config/ при сборке
+# Чтение config/<profile>.toml на бейке: один формат и один способ его читать
+# на все игры (P7.6). Base58-декод адресов — там же.
+crown-games-common = { path = "../../common" }
 
 [dev-dependencies]
 ed25519-dalek = "2"       # SigningKey/Signer в тестах протокола и запроса

@@ -109,6 +109,27 @@ fn advance(c: &mut Collection, now: u64) -> Result<(), StepError> {
     Ok(())
 }
 
+impl State {
+    /// Whether this state admits `action` by the transition table alone — the
+    /// **time-free** half of `apply_action`'s verdict, for the boundary
+    /// (`games-harness.md §6`). Same mechanism and same soundness argument as
+    /// `conditional_tasks_logic::State::admits`.
+    ///
+    /// Safe against the **stored**, un-advanced state: the only move time can
+    /// make is into `Decided` (see `advance`), and `Decided` admits nothing. So a
+    /// `false` here is doomed in every state time could have produced. A `true` is
+    /// a filter, not a verdict — the update still advances the clock and `Vote`
+    /// still owes its threshold and dedup.
+    pub fn admits(self, action: &Action) -> bool {
+        matches!(
+            (self, action),
+            (_, Action::Tick)
+                | (State::Funding, Action::Ready | Action::RecipientCancel)
+                | (State::Voting { .. }, Action::Vote(_))
+        )
+    }
+}
+
 /// Apply an action to the (already advanced) state. Exhaustive, no `_ =>`.
 fn apply_action(c: &mut Collection, action: Action, now: u64) -> Result<(), StepError> {
     match (c.state, action) {
@@ -173,6 +194,46 @@ mod tests {
             voter: [voter; 32],
             weight,
             done,
+        }
+    }
+
+    /// `State::admits` and `apply_action` are two readings of one transition
+    /// table: the boundary trusts the first, the update obeys the second. Drift
+    /// is the exposure — a `true` the update refuses is a doomed call billed to
+    /// the canister, a `false` it would have accepted is a valid call silently
+    /// dropped. Enumerated over every pair, not sampled.
+    #[test]
+    fn admits_agrees_with_apply_action_on_every_pair() {
+        let states = [
+            State::Funding,
+            State::Voting {
+                started_at: CREATED,
+            },
+            State::Decided {
+                outcome: Outcome::Settle,
+            },
+            State::Decided {
+                outcome: Outcome::Refund,
+            },
+        ];
+        let actions = [
+            Action::Ready,
+            Action::RecipientCancel,
+            Action::Vote(vote(1, MIN_VOTE_WEIGHT, true)),
+            Action::Tick,
+        ];
+        for s in states {
+            for a in &actions {
+                let mut c = collection(s, Vec::new());
+                // Clock pinned before every window so `advance` cannot fire and
+                // only the action's own verdict is compared.
+                let applied = step(&mut c, a.clone(), CREATED);
+                assert_eq!(
+                    s.admits(a),
+                    applied != Err(StepError::InvalidTransition),
+                    "state {s:?} × action {a:?}: admits() and apply_action disagree"
+                );
+            }
         }
     }
 

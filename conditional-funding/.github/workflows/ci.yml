@@ -22,6 +22,15 @@ jobs:
         run: |
           ! grep -rnE 'http_request|SolRpc|sol_rpc|management_canister::.*http' canister/src
 
+      # Border (games-harness §6 / spec §Методы): the certificate's BLS pairings
+      # live **only** on the paid `push_root`. On the anonymous boundary
+      # (`inspect_message`, 200M instructions) they do not fit — a valid
+      # registration/vote could not be admitted at all. Every per-caller proof is a
+      # hash-tree walk against the `ROOTS` cache.
+      - name: BLS only on the paid push_root
+        run: |
+          test "$(grep -c 'birth::certified_root' canister/src/lib.rs)" = "1"
+          grep -A 12 'fn push_root' canister/src/lib.rs | grep -q 'birth::certified_root'
       # Border (games-harness §3): без таймеров/поллинга.
       - name: no timers
         run: |

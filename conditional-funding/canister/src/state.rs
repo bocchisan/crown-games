@@ -19,6 +19,11 @@ struct Stored {
     recipient: [u8; 32],
 }
 
+// The verdict signature store and its claim-before-await discipline live in
+// `crown_games_common::signing` — non-negativity invariant #5, one mechanism
+// for every game rather than three byte-identical copies (`P7.6`).
+pub use crown_games_common::signing::SignedVerdict;
+
 thread_local! {
     static COLLECTIONS: RefCell<BTreeMap<[u8; 32], Stored>> =
         const { RefCell::new(BTreeMap::new()) };
@@ -84,6 +89,37 @@ pub fn recipient_action(
 /// The recipient a collection was materialized for (for weight-proof keying).
 pub fn collection_recipient(collection_id: &[u8; 32]) -> Option<[u8; 32]> {
     COLLECTIONS.with_borrow(|c| c.get(collection_id).map(|s| s.recipient))
+}
+
+/// Time-free boundary pre-check for a recipient action (harness §6), the twin of
+/// [`vote_admits`]: unknown collection, wrong signer, or a stored state whose
+/// transition table does not admit the action.
+///
+/// Sound on the time-free boundary for the same reason `vote_admits` is: the only
+/// move time can make is into `Decided`, which admits nothing, so an action the
+/// stored state refuses is refused in every state time could have produced
+/// (`conditional_funding_logic::State::admits`, pinned to `apply_action` by an
+/// exhaustive test). A strict subset of `recipient_action`'s rejections, which
+/// stays the authoritative gate.
+///
+/// Without this the boundary admitted every action from the right signer and left
+/// the refusal to the update — so a doomed `ready` could be repeated forever and
+/// executed replicated each time, free for the sender and billed to the canister.
+pub fn action_admits(
+    collection_id: &[u8; 32],
+    signer: &[u8; 32],
+    action: &Action,
+) -> Result<(), StateError> {
+    COLLECTIONS.with_borrow(|c| {
+        let s = c.get(collection_id).ok_or(StateError::NotFound)?;
+        if s.recipient != *signer {
+            return Err(StateError::NotRecipient);
+        }
+        if !s.collection.state.admits(action) {
+            return Err(StateError::Step(StepError::InvalidTransition));
+        }
+        Ok(())
+    })
 }
 
 /// Time-free boundary pre-check for a vote (harness §6): the cheap committed-state
@@ -176,7 +212,13 @@ mod tests {
 
     fn reset() {
         COLLECTIONS.with_borrow_mut(BTreeMap::clear);
+        crown_games_common::signing::reset_for_test();
     }
+
+    // The signature store's own behaviour — repeat served free, one claim at a
+    // time, an aborted signing left retriable — is tested once, in
+    // `crown_games_common::signing`. Re-testing it per game re-tested one
+    // mechanism three times and told us nothing about this game (`P7.6`).
 
     fn vote(voter: u8, weight: u128, done: bool) -> Vote {
         Vote {
@@ -311,6 +353,76 @@ mod tests {
         );
     }
 
+    /// The boundary must refuse a doomed recipient action, not leave it to the
+    /// update — otherwise one signed `ready` is a flood template billed to us.
+    #[test]
+    fn action_admits_refuses_what_the_state_will_refuse() {
+        reset();
+        let id = [1u8; 32];
+        let recipient = [9u8; 32];
+
+        assert_eq!(
+            action_admits(&id, &recipient, &Action::Ready),
+            Err(StateError::NotFound)
+        );
+
+        materialize(id, fresh_collection(), recipient).unwrap();
+        assert_eq!(
+            action_admits(&id, &[8u8; 32], &Action::Ready),
+            Err(StateError::NotRecipient)
+        );
+        // `Funding` admits both recipient actions.
+        assert_eq!(action_admits(&id, &recipient, &Action::Ready), Ok(()));
+        assert_eq!(
+            action_admits(&id, &recipient, &Action::RecipientCancel),
+            Ok(())
+        );
+
+        // After `ready` the collection is `Voting`: both are doomed and now die
+        // here rather than being executed and refused by the update.
+        recipient_action(&id, &recipient, Action::Ready, CREATED).unwrap();
+        for a in [Action::Ready, Action::RecipientCancel] {
+            assert_eq!(
+                action_admits(&id, &recipient, &a),
+                Err(StateError::Step(StepError::InvalidTransition)),
+                "{a:?} must be refused once voting has opened"
+            );
+        }
+
+        // Decided is absorbing.
+        reset();
+        materialize(id, fresh_collection(), recipient).unwrap();
+        recipient_action(&id, &recipient, Action::RecipientCancel, CREATED).unwrap();
+        for a in [Action::Ready, Action::RecipientCancel] {
+            assert_eq!(
+                action_admits(&id, &recipient, &a),
+                Err(StateError::Step(StepError::InvalidTransition)),
+                "{a:?} must be refused on a decided collection"
+            );
+        }
+    }
+
+    /// Every boundary rejection must be one the update would also make, or a
+    /// legitimate call is dropped for free and reads as a refusal without cause.
+    #[test]
+    fn action_admits_never_refuses_what_the_update_would_accept() {
+        for action in [Action::Ready, Action::RecipientCancel] {
+            reset();
+            let id = [1u8; 32];
+            let recipient = [9u8; 32];
+            materialize(id, fresh_collection(), recipient).unwrap();
+            assert_eq!(
+                action_admits(&id, &recipient, &action),
+                Ok(()),
+                "boundary refused {action:?}, which the update accepts"
+            );
+            assert!(
+                recipient_action(&id, &recipient, action.clone(), CREATED).is_ok(),
+                "update refused {action:?} the boundary admitted"
+            );
+        }
+    }
+
     #[test]
     fn vote_admits_is_a_subset_of_add_vote_and_needs_no_weight_proof() {
         reset();
@@ -337,6 +449,9 @@ mod tests {
             Err(StateError::Step(StepError::DuplicateVoter))
         );
         assert_eq!(vote_admits(&id, &[2; 32], 500), Ok(()));
-        assert_eq!(vote_admits(&id, &[2; 32], 1), Err(StateError::VoteCapReached));
+        assert_eq!(
+            vote_admits(&id, &[2; 32], 1),
+            Err(StateError::VoteCapReached)
+        );
     }
 }

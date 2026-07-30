@@ -112,6 +112,29 @@ fn advance(task: &mut Task, now: i64) -> Result<(), StepError> {
     Ok(())
 }
 
+impl State {
+    /// Whether this state admits `action` by the transition table alone — the
+    /// **time-free** half of `apply_action`'s verdict, for the boundary
+    /// (`games-harness.md §6`).
+    ///
+    /// Safe to answer against the **stored**, un-advanced state: the only move
+    /// time can make is into `Decided`, and `Decided` admits nothing. So a `false`
+    /// here is doomed in every state time could have produced — which is what
+    /// lets the boundary refuse without reading the clock. A `true` is *not*
+    /// authoritative: the state may since have advanced, and `Vote` still owes
+    /// its threshold and dedup. Refusal is exact, admission is a filter — exactly
+    /// the asymmetry the boundary is allowed.
+    pub fn admits(self, action: &Action) -> bool {
+        matches!(
+            (self, action),
+            (_, Action::Tick)
+                | (State::Created, Action::Accept | Action::Decline)
+                | (State::Accepted, Action::Decline | Action::Ready)
+                | (State::Voting { .. }, Action::Vote(_))
+        )
+    }
+}
+
 /// Apply an action to the (already advanced) state. Exhaustive, no `_ =>`.
 fn apply_action(task: &mut Task, action: Action, now: i64) -> Result<(), StepError> {
     match (task.state, action) {
@@ -186,6 +209,50 @@ mod tests {
     }
     fn voting_end() -> i64 {
         D - DEADLINE_MARGIN
+    }
+
+    /// `State::admits` and `apply_action` are two readings of one transition
+    /// table, and the boundary trusts the first while the update obeys the
+    /// second. Drift between them is the whole exposure — a `true` the update
+    /// then refuses is a doomed call executed at our expense, and a `false` the
+    /// update would have accepted is a valid call silently dropped. So the
+    /// agreement is enumerated over **every** (state, action) pair rather than
+    /// sampled: the domain is 4 × 5, small enough that there is no excuse.
+    ///
+    /// The clock is pinned at 0 (before every window) so `advance` cannot fire
+    /// and only the action's own verdict is compared.
+    #[test]
+    fn admits_agrees_with_apply_action_on_every_pair() {
+        let states = [
+            State::Created,
+            State::Accepted,
+            State::Voting { started_at: 0 },
+            State::Decided {
+                outcome: Outcome::Settle,
+            },
+            State::Decided {
+                outcome: Outcome::Cancel,
+            },
+        ];
+        let actions = [
+            Action::Accept,
+            Action::Decline,
+            Action::Ready,
+            Action::Vote(vote(1, MIN_VOTE_WEIGHT, true)),
+            Action::Tick,
+        ];
+        for s in states {
+            for a in &actions {
+                let mut t = task(s, Vec::new());
+                let applied = step(&mut t, a.clone(), 0);
+                let rejected_as_invalid = applied == Err(StepError::InvalidTransition);
+                assert_eq!(
+                    s.admits(a),
+                    !rejected_as_invalid,
+                    "state {s:?} × action {a:?}: admits() and apply_action disagree"
+                );
+            }
+        }
     }
 
     #[test]

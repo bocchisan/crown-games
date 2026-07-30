@@ -12,6 +12,8 @@ crown-derive = { path = "../../crown-factory/derive" }  # адрес эскро�
 crown-salt = { path = "../../crown-factory/salt" }       # соль формы two-outcome
 ed25519-dalek = "2"             # verify_strict кошельковых подписей
 bs58 = "0.5"                    # bs58 → [u8;N] в подписываемых сообщениях
+sha2 = "0.10"                   # ChainId = sha256("crown-chain:v1:" ‖ id) — ключ книги, общий с индексом
+hex = "0.4"                     # hex-поля запроса (свидетель, сертификат, хеш текста)
 ic-certification = "3"          # HashTree.lookup/digest свидетеля рождения (пруф против корня индекса)
 ic-verify-bls-signature = "0.6" # BLS-проверка сертификата индекса против NNS root key (канистра слепа)
 serde_cbor = "0.11"             # CBOR-декод свидетеля/сертификата

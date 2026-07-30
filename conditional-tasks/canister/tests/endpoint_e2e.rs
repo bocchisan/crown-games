@@ -4,7 +4,7 @@
 //!
 //! Ingress cannot attach cycles, and `request_signature` is dropped by
 //! `inspect_message` on a direct ingress, so the payment gates are reachable only
-//! from an inter-canister caller. The `relay-proxy` fixture (`../e2e/relay-proxy`)
+//! from an inter-canister caller. The `relay-proxy` fixture (`crown-games/e2e-fixtures/relay-proxy`)
 //! forwards the call with a chosen cycle amount and hands back the raw reply.
 //!
 //! Run with the bundled server:
@@ -22,12 +22,13 @@ use conditional_tasks::{InitArgs, TaskResult};
 use pocket_ic::{PocketIc, PocketIcBuilder};
 
 const SIGN_PRICE: u128 = 26_200_000_000; // config/testnet.toml
+const ROOT_PRICE: u128 = 1_000_000_000; // config/testnet.toml
 const CHAIN: &str = "devnet";
 
 const WASM: &str = "../target/wasm32-unknown-unknown/release/conditional_tasks.wasm";
-const PROXY_DIR: &str = "../e2e/relay-proxy";
+const PROXY_DIR: &str = "../../e2e-fixtures/relay-proxy";
 const PROXY_WASM: &str =
-    "../e2e/relay-proxy/target/wasm32-unknown-unknown/release/relay_proxy.wasm";
+    "../../e2e-fixtures/relay-proxy/target/wasm32-unknown-unknown/release/relay_proxy.wasm";
 
 fn build(dir: &str, extra: &[&str]) {
     let mut args = vec!["build", "--release", "--target", "wasm32-unknown-unknown"];
@@ -98,6 +99,28 @@ fn request_signature(
     Decode!(&raw, TaskResult).expect("decode TaskResult")
 }
 
+/// Drive `push_root(cert)` through the proxy with `cycles` attached and decode
+/// the `TaskResult`.
+fn push_root(
+    pic: &PocketIc,
+    proxy: Principal,
+    game: Principal,
+    cert: &[u8],
+    cycles: u128,
+) -> TaskResult {
+    let inner = Encode!(&cert.to_vec()).unwrap();
+    let arg = Encode!(&game, &"push_root".to_string(), &inner, &cycles).unwrap();
+    let reply = pic
+        .update_call(proxy, Principal::anonymous(), "relay", arg)
+        .expect("proxy relay call");
+    let raw = Decode!(&reply, Vec<u8>).expect("proxy returns raw reply bytes");
+    assert!(
+        !raw.is_empty(),
+        "the inter-canister call itself was rejected"
+    );
+    Decode!(&raw, TaskResult).expect("decode TaskResult")
+}
+
 // A well-formed base58 32-byte task id that names nothing (`task_id` parses via bs58).
 fn unknown_task() -> String {
     bs58::encode([0u8; 32]).into_string()
@@ -124,6 +147,25 @@ fn a_paid_call_for_an_undecided_task_is_not_charged() {
     // `NotDecided` (no charge until the verdict is final).
     let r = request_signature(&pic, proxy, game, CHAIN, &unknown_task(), SIGN_PRICE);
     assert!(matches!(r, TaskResult::NotDecided), "got {r:?}");
+}
+
+#[test]
+fn an_unpaid_push_root_does_no_work() {
+    let (pic, game, proxy) = setup();
+    // Below `ROOT_PRICE` the BLS pairings must not run at all: the cheapest,
+    // most decisive check wins first (`cost.md §6` #2).
+    let r = push_root(&pic, proxy, game, &[0u8; 64], 0);
+    assert!(matches!(r, TaskResult::Underpaid), "got {r:?}");
+}
+
+#[test]
+fn a_paid_push_root_with_a_bogus_certificate_is_refused() {
+    let (pic, game, proxy) = setup();
+    // Paid, so the pairings run — and fail. Payment is accepted *before* the
+    // pairings and is not refunded: fund-then-fail must not be cheaper than the
+    // work it triggers (`01-standards §Тесты 4`).
+    let r = push_root(&pic, proxy, game, b"not-a-certificate", ROOT_PRICE);
+    assert!(matches!(r, TaskResult::BadBirthProof), "got {r:?}");
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //!
 //! Ingress cannot attach cycles, and `request_signature` is dropped by
 //! `inspect_message` on a direct ingress, so the payment gates are reachable only
-//! from an inter-canister caller. The `relay-proxy` fixture (`../e2e/relay-proxy`)
+//! from an inter-canister caller. The `relay-proxy` fixture (`crown-games/e2e-fixtures/relay-proxy`)
 //! forwards the call with a chosen cycle amount and hands back the raw reply.
 //!
 //! Run with the bundled server:
@@ -22,12 +22,13 @@ use conditional_funding::{CollectionResult, InitArgs};
 use pocket_ic::{PocketIc, PocketIcBuilder};
 
 const SIGN_PRICE: u128 = 26_200_000_000; // config/testnet.toml
+const ROOT_PRICE: u128 = 1_000_000_000; // config/testnet.toml
 const CHAIN: &str = "devnet";
 
 const WASM: &str = "../target/wasm32-unknown-unknown/release/conditional_funding.wasm";
-const PROXY_DIR: &str = "../e2e/relay-proxy";
+const PROXY_DIR: &str = "../../e2e-fixtures/relay-proxy";
 const PROXY_WASM: &str =
-    "../e2e/relay-proxy/target/wasm32-unknown-unknown/release/relay_proxy.wasm";
+    "../../e2e-fixtures/relay-proxy/target/wasm32-unknown-unknown/release/relay_proxy.wasm";
 
 fn build(dir: &str, extra: &[&str]) {
     let mut args = vec!["build", "--release", "--target", "wasm32-unknown-unknown"];
@@ -98,6 +99,28 @@ fn request_signature(
     Decode!(&raw, CollectionResult).expect("decode CollectionResult")
 }
 
+/// Drive `push_root(cert)` through the proxy with `cycles` attached and decode
+/// the `CollectionResult`.
+fn push_root(
+    pic: &PocketIc,
+    proxy: Principal,
+    game: Principal,
+    cert: &[u8],
+    cycles: u128,
+) -> CollectionResult {
+    let inner = Encode!(&cert.to_vec()).unwrap();
+    let arg = Encode!(&game, &"push_root".to_string(), &inner, &cycles).unwrap();
+    let reply = pic
+        .update_call(proxy, Principal::anonymous(), "relay", arg)
+        .expect("proxy relay call");
+    let raw = Decode!(&reply, Vec<u8>).expect("proxy returns raw reply bytes");
+    assert!(
+        !raw.is_empty(),
+        "the inter-canister call itself was rejected"
+    );
+    Decode!(&raw, CollectionResult).expect("decode CollectionResult")
+}
+
 // A well-formed 32-byte hex collection id that names nothing.
 fn unknown_collection() -> String {
     "00".repeat(32)
@@ -131,6 +154,50 @@ fn a_paid_call_for_an_undecided_collection_is_not_charged() {
     // `NotDecided` (no charge until the verdict is final).
     let r = request_signature(&pic, proxy, game, CHAIN, &unknown_collection(), SIGN_PRICE);
     assert!(matches!(r, CollectionResult::NotDecided), "got {r:?}");
+}
+
+#[test]
+fn an_unpaid_push_root_does_no_work() {
+    let (pic, game, proxy) = setup();
+    // Below `ROOT_PRICE` the BLS pairings must not run at all: the cheapest,
+    // most decisive check wins first (`cost.md §6` #2).
+    let r = push_root(&pic, proxy, game, &[0u8; 64], 0);
+    assert!(matches!(r, CollectionResult::Underpaid), "got {r:?}");
+}
+
+#[test]
+fn a_paid_push_root_with_a_bogus_certificate_is_refused() {
+    let (pic, game, proxy) = setup();
+    // Paid, so the pairings run — and fail. Payment is accepted *before* the
+    // pairings and is not refunded: fund-then-fail must not be cheaper than the
+    // work it triggers (`01-standards §Тесты 4`).
+    let r = push_root(&pic, proxy, game, b"not-a-certificate", ROOT_PRICE);
+    assert!(matches!(r, CollectionResult::BadBirthProof), "got {r:?}");
+}
+
+#[test]
+fn a_create_with_a_witness_but_no_cached_root_is_refused() {
+    let (pic, game, _proxy) = setup();
+    // The boundary trusts the `ROOTS` cache, never a caller-supplied certificate.
+    // With no root pushed yet, a witness has nothing to reconstruct against, so a
+    // create carrying one is refused — for free, before replicated execution.
+    let text = format!(
+        "action: create\nchain: {CHAIN}\ncanister: {game}\ncollection: {}\nduration: 3600\
+         \n---\npubkey: 11111111111111111111111111111111\nsignature: 1111\
+         \nrecipient_nonce: 1\nwitness: {}",
+        unknown_collection(),
+        "ab".repeat(64),
+    );
+    let res = pic.update_call(
+        game,
+        Principal::anonymous(),
+        "create_collection",
+        Encode!(&text).unwrap(),
+    );
+    assert!(
+        res.is_err(),
+        "no cached root → the boundary drops the create, it never executes"
+    );
 }
 
 #[test]

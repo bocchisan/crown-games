@@ -287,9 +287,22 @@ fn main() -> R<()> {
     // ---- 3) refund: permissionless after the overdue margin ----
     println!("\n[3] refund → permissionless after the overdue margin");
     let before = balance(&client, &donor_ata);
-    // t0 far in the past (> RELEASE_MARGIN=72h) so the refund bound is passed.
-    let (escrow, vault) = create(&client, &donor, &recipient, &fee_wallet, now(&client)? - 300_000, 1, 3)?;
+    // The refund window opens at `t0 + released·period + RELEASE_MARGIN` (released
+    // = 0 here), but `create_escrow` refuses a `t0` older than `RELEASE_MARGIN` —
+    // a stream must not be born already refundable (`BornRefundable`). The two
+    // bounds meet exactly at `t0 = now − RELEASE_MARGIN`, so the only live way to
+    // reach `refund` is to sit just inside the bound at creation and let real time
+    // cross it. `SLACK` covers the drift between our clock read and the on-chain
+    // clock at execution; we then wait it out.
+    const SLACK: i64 = 90;
+    let t0 = now(&client)? - stream::RELEASE_MARGIN + SLACK;
+    let (escrow, vault) = create(&client, &donor, &recipient, &fee_wallet, t0, 1, 3)?;
     assert_eq_u64("vault funded", balance(&client, &vault), GROSS)?;
+    let due = t0 + stream::RELEASE_MARGIN;
+    println!("    waiting {SLACK}s for the refund window to open…");
+    while now(&client)? < due {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
     let sig = send(&client, &donor, &[refund_ix(&donor.pubkey(), &escrow, &vault, &donor.pubkey())])?;
     println!("    refund tx {sig}");
     assert_eq_u64("donor refunded (whole gross back)", balance(&client, &donor_ata), before)?;

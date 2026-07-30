@@ -6,8 +6,15 @@
 //! (`let else` throughout). Vote (`inspect_message` + weight proof) is T3;
 //! `request_signature` (`sign_with_schnorr`) is T4. The full register→settle
 //! flow is validated on the real network (T5).
+//!
+//! Index trust is split in two so the anonymous boundary stays cheap: the
+//! certificate's BLS pairings run once on the paid `push_root`, and every
+//! per-caller proof (birth, reputation) is a hash-tree walk against a cached
+//! root. Verifying the certificate per call would exceed the 200M-instruction
+//! `inspect_message` budget outright — a valid registration could not be
+//! admitted at all.
 
-use candid::{CandidType, Deserialize, Nat, Principal};
+use candid::{CandidType, Deserialize, Principal};
 use conditional_tasks_logic::{Action, Outcome, State, Task, LOGIC_VERSION};
 use ic_cdk_management_canister::{
     schnorr_public_key, sign_with_schnorr, SchnorrAlgorithm, SchnorrKeyId, SchnorrPublicKeyArgs,
@@ -17,7 +24,6 @@ use std::cell::RefCell;
 
 pub mod config;
 pub mod protocol;
-pub mod request;
 pub mod state;
 pub mod validate;
 
@@ -26,7 +32,9 @@ pub mod validate;
 // the BLS path is never copy-pasted per game. Re-exported to keep the public
 // paths (`conditional_tasks::birth::…`) and the internal `birth::`/`address::`/
 // `resolver::` call sites unchanged.
-pub use crown_games_common::{address, birth, resolver};
+pub use crown_games_common::{
+    address, birth, bs58_array, field, request, resolver, roots, signing, MAX_ARG_BYTES, V_MAX,
+};
 
 thread_local! {
     /// Cached threshold master (public key + chain code); resolvers derive from it.
@@ -35,24 +43,19 @@ thread_local! {
     static INDEX: RefCell<Principal> = const { RefCell::new(Principal::anonymous()) };
     /// NNS root key that authenticates the index's certificate (blind proof).
     static NNS_ROOT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Recently verified index roots (newest last). A birth/reputation witness is
+    /// admitted against any of them; the BLS that authenticates a root runs once,
+    /// on the paid `push_root`, never on the anonymous boundary. Canister state,
+    /// so it lives here; the cache policy is `roots` (one copy for every game).
+    static ROOTS: RefCell<Vec<[u8; 32]>> = const { RefCell::new(Vec::new()) };
 }
 
-/// IC mainnet root key — finalized at P8 (the pinned NNS BLS key; fill from the
-/// official published value, never a guessed constant). On testnet it is supplied
-/// via `init`. Empty fails every birth proof closed (safe), and on the mainnet
-/// profile `init` traps rather than ship a dead trust anchor (mirrors the
-/// `genesis_unix == 0` build guard).
-const IC_MAINNET_ROOT_KEY: &[u8] = &[];
-
-/// Cap of votes per task (non-negativity invariant #7; cost.md §6 `V_MAX`).
-const V_MAX: usize = 500;
-
-/// Cap of distinct recipient profiles. `set_profile` is the only write not
-/// gated by a birth proof — any freshly-signed key can add one — so without a
-/// ceiling `PROFILES` grows for free and unbounded. Sized well above any real
-/// recipient count; an existing recipient can always update in place, only a
-/// new one past the cap is refused (non-negativity invariant #7, cost.md §6).
-const P_MAX: usize = 100_000;
+// Every write this canister accepts is gated by a birth proof, so none of them
+// needs a cap: an escrow is what pays for the byte it stores (`00 §11`). The one
+// exception used to be `set_profile`, and the cap it needed (`P_MAX`) was itself
+// the exposure — a table anyone could fill with fresh keys, after which no new
+// recipient could ever be stored, on a canister whose state cannot be migrated.
+// Both are gone with the table (`P7.14`, `state.rs`).
 
 /// Deploy-time overrides (testnet): the index principal and the NNS root key
 /// (PocketIC / a test IC differ from mainnet). Barred on mainnet.
@@ -72,13 +75,11 @@ pub enum TaskStateView {
     DecidedCancel,
 }
 
-/// A recipient profile, for `get_profile`.
+/// A produced verdict signature, for `get_signature`.
 #[derive(CandidType, Deserialize, Clone, Debug)]
-pub struct ProfileView {
-    pub enabled: bool,
-    pub min_gross: u64,
-    pub min_reputation: Nat,
-    pub counter: u64,
+pub struct SignatureView {
+    pub outcome: u8,
+    pub signature: Vec<u8>,
 }
 
 /// Outcome of an update — flat and typed.
@@ -87,13 +88,14 @@ pub enum TaskResult {
     // success
     Materialized,
     Advanced(TaskStateView),
-    ProfileSet,
     KeyBootstrapped,
     /// A verdict signature: `outcome` (settle=0/cancel=1) + the schnorr signature.
     Signed {
         outcome: u8,
         signature: Vec<u8>,
     },
+    /// A certified index root was authenticated and cached.
+    RootPushed,
     // wiring / request
     Malformed,
     WrongTarget,
@@ -101,15 +103,14 @@ pub enum TaskResult {
     TaskIdMismatch,
     BadBirthProof,
     FieldMismatch,
-    ProfileMinBelowFloor,
-    Underpaid,  // attached cycles below SIGN_PRICE
+    Underpaid,  // attached cycles below SIGN_PRICE / ROOT_PRICE
     NotDecided, // verdict not yet finalized
     SignFailed, // sign_with_schnorr rejected
+    /// A sibling call is already signing this scope — free, no charge. Retry and
+    /// the produced signature is served from store.
+    SignInFlight,
     // registration validation
-    ProfileDisabled,
     GrossBelowFloor,
-    GrossBelowMinimum,
-    ReputationBelowMinimum,
     DurationOutOfRange,
     DeadlineTooTight,
     TimeOverflow,
@@ -117,9 +118,7 @@ pub enum TaskResult {
     AlreadyExists,
     NotFound,
     NotRecipient,
-    StaleCounter,
     VoteCapReached,
-    ProfileCapReached,
     // step
     InvalidTransition,
     WeightBelowThreshold,
@@ -142,13 +141,8 @@ fn init(overrides: Option<InitArgs>) {
         None => {
             let index = Principal::from_text(config::CROWN_INDEX)
                 .unwrap_or_else(|_| ic_cdk::trap("baked index principal is invalid"));
-            if config::PROFILE == "mainnet" && IC_MAINNET_ROOT_KEY.is_empty() {
-                ic_cdk::trap(
-                    "IC_MAINNET_ROOT_KEY is unset (P8: pin the NNS root key before mainnet)",
-                );
-            }
             INDEX.with_borrow_mut(|i| *i = index);
-            NNS_ROOT.with_borrow_mut(|k| *k = IC_MAINNET_ROOT_KEY.to_vec());
+            NNS_ROOT.with_borrow_mut(|k| *k = crown_games_common::IC_MAINNET_ROOT_KEY.to_vec());
         }
     }
 }
@@ -202,9 +196,8 @@ fn register_task(text: String) -> TaskResult {
         deadline: r.deadline,
         voting_period: config::VOTING_PERIOD,
         now: now_secs(),
-        donor_reputation: r.donor_reputation,
     };
-    if let Err(e) = validate::validate_registration(&r.profile, config::MIN_GROSS, &inp) {
+    if let Err(e) = validate::validate_registration(config::MIN_GROSS, &inp) {
         return reg_error(e);
     }
     let task = Task {
@@ -234,18 +227,6 @@ fn ready(text: String) -> TaskResult {
     recipient_action(&text, "ready", Action::Ready)
 }
 
-#[ic_cdk::update]
-fn set_profile(text: String) -> TaskResult {
-    let (recipient, profile, counter) = match admit_profile(&text) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    match state::set_profile(recipient, profile, counter, P_MAX) {
-        Ok(()) => TaskResult::ProfileSet,
-        Err(e) => state_error(e),
-    }
-}
-
 /// A reputation-weighted vote. Admissibility (signature + weight proof ≥
 /// `MIN_VOTE_WEIGHT`) is gated at the boundary via `admit_vote`; here the same
 /// check runs authoritatively, then the `(task_id, voter)` dedup + `V_MAX` cap
@@ -261,12 +242,6 @@ fn vote(text: String) -> TaskResult {
         Err(e) => state_error(e),
     }
 }
-
-/// Largest ingress arg accepted. A legitimate signed request — even a birth
-/// proof carrying a hex `cert` + `witness` — is a few KB; this leaves ample
-/// headroom while dropping a multi-MB flood before it can force parsing, hex
-/// decoding, or (on the vote path) BLS verification. Mirrors the relay's guard.
-const MAX_ARG_BYTES: usize = 32 * 1024;
 
 /// The boundary (non-negativity invariant #2, harness §6): a state-changing
 /// ingress is admitted only if it would pass — its `admit_*` check (signature +
@@ -298,26 +273,74 @@ fn inspect_message() {
     }
 }
 
-/// Paid pull (fronted by the relay for `SIGN_PRICE`): the per-scope resolver
-/// signs the finalized verdict. Payment is accepted **before** `sign_with_schnorr`;
-/// a not-yet-`Decided` task is refused without charge. One signature per scope,
-/// reused by its escrow's `claim(outcome, sig)`.
+/// Paid pull (fronted by the relay for `ROOT_PRICE`): authenticate a fresh index
+/// root and cache it, so the anonymous boundary can admit birth/reputation
+/// witnesses with a hash-tree walk alone.
+///
+/// The certificate costs two BLS pairings (the index's signature plus the subnet
+/// delegation) — far past the 200M-instruction budget of `inspect_message`, so it
+/// cannot live there; and free on `update` it would be a replicated pairing for
+/// any anonymous byte string. Charging it makes the one expensive step the paid
+/// one and keeps every per-caller path cheap (`cost.md §6` #2).
+///
+/// Payment is accepted **before** the pairings, and a bogus certificate is not
+/// refunded: fund-then-fail must not be cheaper than the work it triggers
+/// (`01-standards §Тесты 4`).
 #[ic_cdk::update]
-async fn request_signature(chain: String, task: String) -> TaskResult {
-    if ic_cdk::api::msg_cycles_available() < config::SIGN_PRICE {
+fn push_root(cert: Vec<u8>) -> TaskResult {
+    if ic_cdk::api::msg_cycles_available() < config::ROOT_PRICE {
         return TaskResult::Underpaid;
     }
+    ic_cdk::api::msg_cycles_accept(config::ROOT_PRICE);
+
+    let index = INDEX.with_borrow(|i| *i);
+    let root_key = NNS_ROOT.with_borrow(|k| k.clone());
+    let Some(root) = birth::certified_root(&cert, &root_key, index.as_slice()) else {
+        return TaskResult::BadBirthProof;
+    };
+    ROOTS.with_borrow_mut(|cache| roots::remember(cache, root));
+    TaskResult::RootPushed
+}
+
+/// Paid pull (fronted by the relay for `SIGN_PRICE`): the per-scope resolver
+/// signs the finalized verdict. One signature per scope, reused by its escrow's
+/// `claim(outcome, sig)`.
+///
+/// Gate order mirrors the index's `ingest` (`crown-indexer/src/gate.rs`): the
+/// cheapest, most decisive check wins first, and only the last step may charge.
+/// A scope that was already signed is served **free** — the threshold signature
+/// is deterministic in `(scope, outcome)` and the outcome is immutable once
+/// `Decided` (harness §8), so re-signing would buy the same bytes twice. A
+/// not-yet-`Decided` task is refused without charge; payment is accepted only
+/// immediately before `sign_with_schnorr`, and on failure it is not refunded
+/// (`01-standards §Тесты 4`).
+#[ic_cdk::update]
+async fn request_signature(chain: String, task: String) -> TaskResult {
     if chain != config::CHAIN_ID {
         return TaskResult::WrongTarget;
     }
-    let Some(task_id) = request::bs58_array::<32>(&task) else {
+    let Some(task_id) = bs58_array::<32>(&task) else {
         return TaskResult::Malformed;
     };
+    // Already signed → the same bytes, for free. Ahead of the payment check on
+    // purpose: a repeat costs one read, so it is never worth charging for.
+    if let Some((outcome, signature)) = signing::cached(&task_id) {
+        return TaskResult::Signed { outcome, signature };
+    }
+    if ic_cdk::api::msg_cycles_available() < config::SIGN_PRICE {
+        return TaskResult::Underpaid;
+    }
     let outcome = match state::verdict(&task_id, now_secs()) {
         Some(Outcome::Settle) => 0u8,
         Some(Outcome::Cancel) => 1u8,
         None => return TaskResult::NotDecided, // no charge until the verdict is final
     };
+    // Claim the scope *before* the await: the store only lands after it, so
+    // without this N concurrent requests would each miss the cache and each pay.
+    // A losing sibling is free — it retries and finds the stored signature.
+    if !signing::claim(task_id) {
+        return TaskResult::SignInFlight;
+    }
 
     // Payment accepted only now, before the (paid) threshold signature.
     ic_cdk::api::msg_cycles_accept(config::SIGN_PRICE);
@@ -331,11 +354,17 @@ async fn request_signature(chain: String, task: String) -> TaskResult {
         aux: None,
     };
     match sign_with_schnorr(&arg).await {
-        Ok(res) => TaskResult::Signed {
-            outcome,
-            signature: res.signature,
-        },
-        Err(_) => TaskResult::SignFailed,
+        Ok(res) => {
+            signing::store(task_id, outcome, res.signature.clone());
+            TaskResult::Signed {
+                outcome,
+                signature: res.signature,
+            }
+        }
+        Err(_) => {
+            signing::release(&task_id); // keep the scope retriable
+            TaskResult::SignFailed
+        }
     }
 }
 
@@ -348,42 +377,40 @@ fn get_logic_version() -> u32 {
 
 #[ic_cdk::query]
 fn get_resolver(task: String) -> Option<String> {
-    let tid = request::bs58_array::<32>(&task)?;
+    let tid = bs58_array::<32>(&task)?;
     let (pk, cc) = MASTER.with_borrow(|m| *m)?;
     resolver::resolver(&pk, &cc, &tid).map(|r| bs58::encode(r).into_string())
 }
 
 #[ic_cdk::query]
 fn get_task(task: String) -> Option<TaskStateView> {
-    let tid = request::bs58_array::<32>(&task)?;
+    let tid = bs58_array::<32>(&task)?;
     state::task_state(&tid, now_secs()).map(state_view)
 }
 
 #[ic_cdk::query]
 fn get_verdict(task: String) -> Option<TaskStateView> {
-    let tid = request::bs58_array::<32>(&task)?;
+    let tid = bs58_array::<32>(&task)?;
     match state::verdict(&tid, now_secs())? {
         Outcome::Settle => Some(TaskStateView::DecidedSettle),
         Outcome::Cancel => Some(TaskStateView::DecidedCancel),
     }
 }
 
+/// The verdict signature already produced for a scope, if any. Free query — a
+/// claimer that lost the race, or one that simply needs the bytes again, reads
+/// them here instead of paying the relay to re-request a `SIGN_PRICE` pull.
 #[ic_cdk::query]
-fn get_profile(recipient: String) -> Option<ProfileView> {
-    let r = request::bs58_array::<32>(&recipient)?;
-    let (p, counter) = state::profile_and_counter(&r, config::MIN_GROSS);
-    Some(ProfileView {
-        enabled: p.enabled,
-        min_gross: p.min_gross,
-        min_reputation: Nat::from(p.min_reputation),
-        counter,
-    })
+fn get_signature(task: String) -> Option<SignatureView> {
+    let tid = bs58_array::<32>(&task)?;
+    let (outcome, signature) = signing::cached(&tid)?;
+    Some(SignatureView { outcome, signature })
 }
 
 // ---- helpers ----
 
 fn recipient_action(text: &str, action_name: &str, action: Action) -> TaskResult {
-    let (task_id, signer) = match admit_action(text, action_name) {
+    let (task_id, signer) = match admit_action(text, action_name, &action) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -394,22 +421,20 @@ fn recipient_action(text: &str, action_name: &str, action: Action) -> TaskResult
 }
 
 /// The voter's weight = their reputation to the task's recipient, proven by the
-/// book witness against the certified index root. `None` if the proof is invalid
-/// or the task is unknown.
+/// book witness against an already-authenticated index root. `None` if the proof
+/// is invalid or the task is unknown.
+///
+/// Like the birth proof, this is a pure hash-tree walk against the `ROOTS` cache
+/// (`push_root` did the BLS, paid). The certificate must not be verified here:
+/// `admit_vote` runs at the boundary, and two pairings per anonymous vote would
+/// blow the 200M-instruction `inspect_message` budget — a *valid* vote could not
+/// be admitted at all (spec §Методы, `cost.md §6` #2). No `cert` extra is read;
+/// the root comes from the cache.
 fn voter_weight(req: &request::Request, task_id: &[u8; 32], voter: &[u8; 32]) -> Option<u128> {
     let recipient = state::task_recipient(task_id)?;
-    let cert = hex_vec(req.extra("cert"))?;
-    let weight_witness = hex_vec(req.extra("weight_witness"))?;
-    let index = INDEX.with_borrow(|i| *i);
-    let root_key = NNS_ROOT.with_borrow(|k| k.clone());
-    let combined_root = birth::certified_root(&cert, &root_key, index.as_slice())?;
-    birth::reputation_from_witness(
-        &weight_witness,
-        &combined_root,
-        &chain_id_hash(),
-        voter,
-        &recipient,
-    )
+    let weight_witness = field::hex_bytes(req.extra("weight_witness"))?;
+    let chain = crown_games_common::chain_id(config::CHAIN_ID);
+    ROOTS.with_borrow(|cache| roots::reputation(cache, &weight_witness, &chain, voter, &recipient))
 }
 
 // ---- Boundary admissibility (harness §6) ----
@@ -428,16 +453,14 @@ struct Registered {
     task_id: [u8; 32],
     recipient: [u8; 32],
     text_hash: [u8; 32],
-    profile: validate::Profile,
     gross: u64,
     duration: i64,
     deadline: i64,
-    donor_reputation: Option<u128>,
 }
 
 /// Admit a `register`: signature + target + fields + the blind birth proof (BLS
-/// vs NNS root → witness → birth, field-matched) + the reputation proof if the
-/// profile demands one. `Err` carries the exact `TaskResult` the update returns.
+/// vs NNS root → witness → birth, field-matched). `Err` carries the exact
+/// `TaskResult` the update returns.
 fn admit_register(text: &str) -> Result<Registered, TaskResult> {
     let Some((master_pk, chain_code)) = MASTER.with_borrow(|m| *m) else {
         return Err(TaskResult::NotBootstrapped);
@@ -450,35 +473,29 @@ fn admit_register(text: &str) -> Result<Registered, TaskResult> {
     }
     let donor = req.pubkey;
     let (Some(task_claimed), Some(text_hash), Some(duration)) = (
-        req.signed("task").and_then(request::bs58_array::<32>),
-        hex32(req.signed("text")),
-        parse_i64(req.signed("duration")),
+        req.signed("task").and_then(bs58_array::<32>),
+        req.signed("text").and_then(field::hex32),
+        field::i64_of(req.signed("duration")),
     ) else {
         return Err(TaskResult::Malformed);
     };
-    let (
-        Some(recipient),
-        Some(gross),
-        Some(deadline),
-        Some(fee_bps),
-        Some(fee_wallet),
-        Some(nonce),
-        Some(cert),
-        Some(witness),
-    ) = (
-        req.extra("recipient").and_then(request::bs58_array::<32>),
-        parse_u64(req.extra("gross")),
-        parse_i64(req.extra("deadline")),
-        parse_u16(req.extra("fee_bps")),
-        req.extra("fee_wallet").and_then(request::bs58_array::<32>),
-        parse_u64(req.extra("nonce")),
-        hex_vec(req.extra("cert")),
-        hex_vec(req.extra("witness")),
-    )
-    else {
+    let (Some(recipient), Some(gross), Some(deadline), Some(nonce), Some(witness)) = (
+        req.extra("recipient").and_then(bs58_array::<32>),
+        field::u64_of(req.extra("gross")),
+        field::i64_of(req.extra("deadline")),
+        field::u64_of(req.extra("nonce")),
+        field::hex_bytes(req.extra("witness")),
+    ) else {
         return Err(TaskResult::Malformed);
     };
 
+    // Fee is the game's price list, not an argument (harness §9): `FEE_BPS` /
+    // `FEE_WALLET` come from config. Taking them from the request would be a
+    // circular check — the birth proof only attests that the escrow was created
+    // with the *same* fee the caller presented, so a donor could bake `fee_wallet
+    // = self` (or `fee_bps = 0`), pass every proof, and take the paid verdict
+    // signature while the platform earned nothing. A mismatched escrow now fails
+    // to derive to `task_claimed`/`address` at all.
     let canister = ic_cdk::api::canister_self();
     let task_id = protocol::task_id(
         canister.as_slice(),
@@ -486,8 +503,8 @@ fn admit_register(text: &str) -> Result<Registered, TaskResult> {
         recipient,
         gross,
         deadline,
-        fee_bps,
-        fee_wallet,
+        config::FEE_BPS,
+        config::FEE_WALLET,
         nonce,
         duration as u64,
         config::VOTING_PERIOD as u64,
@@ -506,8 +523,8 @@ fn admit_register(text: &str) -> Result<Registered, TaskResult> {
         gross,
         deadline,
         resolver,
-        fee_bps,
-        fee_wallet,
+        config::FEE_BPS,
+        config::FEE_WALLET,
         nonce,
     ) else {
         return Err(TaskResult::BadBirthProof);
@@ -520,13 +537,12 @@ fn admit_register(text: &str) -> Result<Registered, TaskResult> {
         return Err(TaskResult::AlreadyExists);
     }
 
-    // Blind birth proof: certificate (BLS vs NNS root) → root → witness → birth.
-    let index = INDEX.with_borrow(|i| *i);
-    let root_key = NNS_ROOT.with_borrow(|k| k.clone());
-    let Some(combined_root) = birth::certified_root(&cert, &root_key, index.as_slice()) else {
-        return Err(TaskResult::BadBirthProof);
-    };
-    let Some(b) = birth::birth_from_witness(&witness, &combined_root, &address) else {
+    // Blind birth proof, boundary half: the witness is reconstructed against an
+    // already-authenticated index root (`push_root` did the BLS, paid). A pure
+    // hash-tree walk, O(log n) — it fits the `inspect_message` budget, which the
+    // certificate's pairings do not (`push_root`).
+    let Some((_root, b)) = ROOTS.with_borrow(|cache| roots::birth(cache, &witness, &address))
+    else {
         return Err(TaskResult::BadBirthProof);
     };
     // `gross` is committed via the escrow address (an input to `escrow_address`
@@ -536,94 +552,51 @@ fn admit_register(text: &str) -> Result<Registered, TaskResult> {
         return Err(TaskResult::FieldMismatch);
     }
 
-    // Reputation proof only if the profile requires it (time-independent).
-    let profile = state::profile(&recipient, config::MIN_GROSS);
-    let donor_reputation = if profile.min_reputation > 0 {
-        let Some(rep_witness) = hex_vec(req.extra("rep_witness")) else {
-            return Err(TaskResult::ReputationBelowMinimum);
-        };
-        birth::reputation_from_witness(
-            &rep_witness,
-            &combined_root,
-            &chain_id_hash(),
-            &donor,
-            &recipient,
-        )
-    } else {
-        None
-    };
+    // One proof, not two. A second witness used to ride along here — the donor's
+    // reputation, read only when the recipient's stored profile demanded it. The
+    // profile is gone (`P7.14`), and with it the only registration-time reader of
+    // the book: reputation is now proven on the vote path alone. The boundary got
+    // cheaper by exactly one hash-tree walk.
 
     Ok(Registered {
         task_id,
         recipient,
         text_hash,
-        profile,
         gross,
         duration,
         deadline,
-        donor_reputation,
     })
 }
 
 /// Admit a recipient action (`accept`/`decline`/`ready`): signature + target +
-/// the signer is the task's recipient. Returns `(task_id, signer)`; the update's
-/// `state::recipient_action` is authoritative on the state transition.
-fn admit_action(text: &str, action_name: &str) -> Result<([u8; 32], [u8; 32]), TaskResult> {
+/// the signer is the task's recipient + the stored state still admits the action.
+/// Returns `(task_id, signer)`; the update's `state::recipient_action` stays
+/// authoritative (it advances time first, so it may still refuse).
+///
+/// The state check is the point (harness §6, `cost.md §6` #2). Without it the
+/// boundary passed every action from the right signer, and a doomed one — a
+/// second `accept`, a `ready` on a decided task — was executed replicated and
+/// billed to the canister. That is free for the sender and unbounded: the signed
+/// half of a request is replayable (the extras carry no nonce), so one observed
+/// valid message is a flood template.
+fn admit_action(
+    text: &str,
+    action_name: &str,
+    action: &Action,
+) -> Result<([u8; 32], [u8; 32]), TaskResult> {
     let Some(req) = request::parse(text) else {
         return Err(TaskResult::Malformed);
     };
     if req.signed("action") != Some(action_name) || !target_ok(&req) {
         return Err(TaskResult::WrongTarget);
     }
-    let Some(task_id) = req.signed("task").and_then(request::bs58_array::<32>) else {
+    let Some(task_id) = req.signed("task").and_then(bs58_array::<32>) else {
         return Err(TaskResult::Malformed);
     };
-    match state::task_recipient(&task_id) {
-        Some(r) if r == req.pubkey => Ok((task_id, req.pubkey)),
-        Some(_) => Err(TaskResult::NotRecipient),
-        None => Err(TaskResult::NotFound),
+    match state::action_admits(&task_id, &req.pubkey, action) {
+        Ok(()) => Ok((task_id, req.pubkey)),
+        Err(e) => Err(state_error(e)),
     }
-}
-
-/// Admit a `set-profile`: signature + target + the recipient signs their own
-/// profile + `min_gross ≥` the floor + the write would be admitted (monotonic
-/// counter, table not full). Returns `(recipient, profile, counter)`.
-fn admit_profile(text: &str) -> Result<([u8; 32], validate::Profile, u64), TaskResult> {
-    let Some(req) = request::parse(text) else {
-        return Err(TaskResult::Malformed);
-    };
-    if req.signed("action") != Some("set-profile") || !target_ok(&req) {
-        return Err(TaskResult::WrongTarget);
-    }
-    let Some(recipient) = req.signed("recipient").and_then(request::bs58_array::<32>) else {
-        return Err(TaskResult::Malformed);
-    };
-    if req.pubkey != recipient {
-        return Err(TaskResult::NotRecipient); // the recipient signs their own profile
-    }
-    let (Some(min_gross), Some(min_reputation), Some(enabled), Some(counter)) = (
-        parse_u64(req.signed("min_gross")),
-        parse_u128(req.signed("min_reputation")),
-        parse_bool(req.signed("enabled")),
-        parse_u64(req.signed("counter")),
-    ) else {
-        return Err(TaskResult::Malformed);
-    };
-    if min_gross < config::MIN_GROSS {
-        return Err(TaskResult::ProfileMinBelowFloor);
-    }
-    if let Err(e) = state::profile_admits(&recipient, counter, P_MAX) {
-        return Err(state_error(e));
-    }
-    Ok((
-        recipient,
-        validate::Profile {
-            enabled,
-            min_gross,
-            min_reputation,
-        },
-        counter,
-    ))
 }
 
 /// Admit a `vote`: signature + target + the weight proof meets `MIN_VOTE_WEIGHT`.
@@ -635,10 +608,10 @@ fn admit_vote(text: &str) -> Result<([u8; 32], conditional_tasks_logic::Vote), T
     if req.signed("action") != Some("vote") || !target_ok(&req) {
         return Err(TaskResult::WrongTarget);
     }
-    let Some(task_id) = req.signed("task").and_then(request::bs58_array::<32>) else {
+    let Some(task_id) = req.signed("task").and_then(bs58_array::<32>) else {
         return Err(TaskResult::Malformed);
     };
-    let Some(done) = req.signed("choice").and_then(parse_choice) else {
+    let Some(done) = req.signed("choice").and_then(field::choice) else {
         return Err(TaskResult::Malformed);
     };
     // Cheap committed-state gate *before* the weight proof (harness §6): a doomed
@@ -669,20 +642,11 @@ fn admit_vote(text: &str) -> Result<([u8; 32], conditional_tasks_logic::Vote), T
 fn admissible(method: &str, text: &str) -> bool {
     match method {
         "register_task" => admit_register(text).is_ok(),
-        "accept" => admit_action(text, "accept").is_ok(),
-        "decline" => admit_action(text, "decline").is_ok(),
-        "ready" => admit_action(text, "ready").is_ok(),
-        "set_profile" => admit_profile(text).is_ok(),
+        "accept" => admit_action(text, "accept", &Action::Accept).is_ok(),
+        "decline" => admit_action(text, "decline", &Action::Decline).is_ok(),
+        "ready" => admit_action(text, "ready", &Action::Ready).is_ok(),
         "vote" => admit_vote(text).is_ok(),
         _ => false,
-    }
-}
-
-fn parse_choice(c: &str) -> Option<bool> {
-    match c {
-        "done" => Some(true),
-        "not_done" => Some(false),
-        _ => None,
     }
 }
 
@@ -695,15 +659,6 @@ fn target_ok(req: &request::Request) -> bool {
 /// Current time in unix seconds (the escrow `deadline` unit).
 fn now_secs() -> i64 {
     (ic_cdk::api::time() / 1_000_000_000) as i64
-}
-
-/// `ChainId` as the index keys the book: `sha256("crown-chain:v1:" ‖ id)`.
-fn chain_id_hash() -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"crown-chain:v1:");
-    h.update(config::CHAIN_ID.as_bytes());
-    h.finalize().into()
 }
 
 fn state_view(s: State) -> TaskStateView {
@@ -723,10 +678,7 @@ fn state_view(s: State) -> TaskStateView {
 fn reg_error(e: validate::RegError) -> TaskResult {
     use validate::RegError as E;
     match e {
-        E::ProfileDisabled => TaskResult::ProfileDisabled,
         E::GrossBelowFloor => TaskResult::GrossBelowFloor,
-        E::GrossBelowMinimum => TaskResult::GrossBelowMinimum,
-        E::ReputationBelowMinimum => TaskResult::ReputationBelowMinimum,
         E::DurationOutOfRange => TaskResult::DurationOutOfRange,
         E::DeadlineTooTight => TaskResult::DeadlineTooTight,
         E::TimeOverflow => TaskResult::TimeOverflow,
@@ -740,40 +692,12 @@ fn state_error(e: state::StateError) -> TaskResult {
         E::AlreadyExists => TaskResult::AlreadyExists,
         E::NotFound => TaskResult::NotFound,
         E::NotRecipient => TaskResult::NotRecipient,
-        E::StaleCounter => TaskResult::StaleCounter,
         E::VoteCapReached => TaskResult::VoteCapReached,
-        E::ProfileCapReached => TaskResult::ProfileCapReached,
         E::Step(Se::InvalidTransition) => TaskResult::InvalidTransition,
         E::Step(Se::WeightBelowThreshold) => TaskResult::WeightBelowThreshold,
         E::Step(Se::DuplicateVoter) => TaskResult::DuplicateVoter,
         E::Step(Se::Overflow) => TaskResult::StepOverflow,
     }
-}
-
-fn parse_u64(s: Option<&str>) -> Option<u64> {
-    s?.parse().ok()
-}
-fn parse_i64(s: Option<&str>) -> Option<i64> {
-    s?.parse().ok()
-}
-fn parse_u16(s: Option<&str>) -> Option<u16> {
-    s?.parse().ok()
-}
-fn parse_u128(s: Option<&str>) -> Option<u128> {
-    s?.parse().ok()
-}
-fn parse_bool(s: Option<&str>) -> Option<bool> {
-    match s? {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-fn hex32(s: Option<&str>) -> Option<[u8; 32]> {
-    hex::decode(s?).ok()?.try_into().ok()
-}
-fn hex_vec(s: Option<&str>) -> Option<Vec<u8>> {
-    hex::decode(s?).ok()
 }
 
 ic_cdk::export_candid!();

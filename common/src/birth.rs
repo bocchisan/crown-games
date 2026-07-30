@@ -18,6 +18,28 @@ use ic_verify_bls_signature::verify_bls_signature;
 /// the trailing 96 bytes.
 const BLS_KEY_LEN: usize = 96;
 
+/// The IC mainnet NNS root key — the trust anchor of every blind proof, and the
+/// one constant here that is not ours: it is the published IC root key, taken
+/// from the network itself (`/api/v2/status` of a boundary node) and cross-checked
+/// against the value DFINITY ships in `ic-agent` (`IC_ROOT_KEY`). Both agree
+/// byte for byte; a guessed constant would fail every proof closed, which reads
+/// as "the boundary rejects everything for no reason".
+///
+/// DER-wrapped, 133 bytes: a 37-byte header (the IC's BLS12-381 OID pair) plus
+/// the raw 96-byte G2 key the verifier strips off. Fixed-size on purpose —
+/// an unset anchor is not expressible, so no game needs a runtime guard saying so.
+///
+/// One copy for all games: the key is shared with the frozen index's certificate,
+/// and a diverged copy would silently fail every reputation and birth proof in
+/// that one game (`crown-spec/docs/games-harness.md §6`).
+pub const IC_MAINNET_ROOT_KEY: &[u8; 133] =
+    b"\x30\x81\x82\x30\x1d\x06\x0d\x2b\x06\x01\x04\x01\x82\xdc\x7c\x05\x03\x01\x02\x01\x06\x0c\x2b\x06\
+      \x01\x04\x01\x82\xdc\x7c\x05\x03\x02\x01\x03\x61\x00\x81\x4c\x0e\x6e\xc7\x1f\xab\x58\x3b\x08\xbd\
+      \x81\x37\x3c\x25\x5c\x3c\x37\x1b\x2e\x84\x86\x3c\x98\xa4\xf1\xe0\x8b\x74\x23\x5d\x14\xfb\x5d\x9c\
+      \x0c\xd5\x46\xd9\x68\x5f\x91\x3a\x0c\x0b\x2c\xc5\x34\x15\x83\xbf\x4b\x43\x92\xe4\x67\xdb\x96\xd6\
+      \x5b\x9b\xb4\xcb\x71\x71\x12\xf8\x47\x2e\x0d\x5a\x4d\x14\x50\x5f\xfd\x74\x84\xb0\x12\x91\x09\x1c\
+      \x5f\x87\xb9\x88\x83\x46\x3f\x98\x09\x1a\x0b\xaa\xae";
+
 /// A recorded escrow birth, as proven by the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Birth {
@@ -28,6 +50,14 @@ pub struct Birth {
 /// Verify the index's certificate against the pinned NNS `root_key` (BLS, one
 /// delegation level) and return the certified data (the combined root) for
 /// `index_principal`. This is the root of trust of the blind birth proof.
+///
+/// **The certificate is authenticated, not dated** — there is no `/time` check,
+/// so an old certificate stays acceptable. That is safe on exactly two standing
+/// facts, and on nothing else: the book is monotone (a stale reputation proof
+/// under-states a weight, never inflates it), and births are never pruned. The
+/// day births start being pruned by terminality (`00-architecture.md §5`), a
+/// stale certificate would prove a settled or refunded escrow still live — see
+/// the trigger row in `crown-spec/docs/08-deferred.md`.
 pub fn certified_root(
     cert_cbor: &[u8],
     root_key: &[u8],
@@ -53,13 +83,18 @@ pub fn certified_root(
 /// that bind any subnet holding a valid NNS delegation for its own range could
 /// sign a forged root for the index (forging births / reputation, and thus an
 /// arbitrary settle/cancel).
-fn verify_cert_signature(cert: &Certificate, root_key: &[u8], index_principal: &[u8]) -> Option<()> {
+fn verify_cert_signature(
+    cert: &Certificate,
+    root_key: &[u8],
+    index_principal: &[u8],
+) -> Option<()> {
     let signing_key = match &cert.delegation {
         None => root_key.to_vec(),
         Some(del) => {
             let del_cert: Certificate = serde_cbor::from_slice(del.certificate.as_ref()).ok()?;
-            check_state_root_sig(&del_cert, root_key)?; // NNS-signed delegation
-            // The delegated subnet may only certify canisters in its range.
+            // NNS-signed delegation; the delegated subnet may only certify
+            // canisters inside its own range.
+            check_state_root_sig(&del_cert, root_key)?;
             let ranges = match del_cert.tree.lookup_path([
                 b"subnet".as_ref(),
                 del.subnet_id.as_ref(),
@@ -288,7 +323,9 @@ mod tests {
         use serde_cbor::Value;
         let arr = pairs
             .iter()
-            .map(|(lo, hi)| Value::Array(vec![Value::Bytes(lo.to_vec()), Value::Bytes(hi.to_vec())]))
+            .map(|(lo, hi)| {
+                Value::Array(vec![Value::Bytes(lo.to_vec()), Value::Bytes(hi.to_vec())])
+            })
             .collect();
         serde_cbor::to_vec(&Value::Array(arr)).unwrap()
     }
@@ -349,5 +386,20 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn the_pinned_nns_key_is_a_der_wrapped_bls_key() {
+        // Guards the paste, not the value: the value is verified against the
+        // network and against `ic-agent` out of band (see the constant's doc).
+        // What can rot here is alignment — a truncated or re-indented literal
+        // still compiles, and the damage (every proof failing closed on mainnet,
+        // where `init` cannot override it) is silent. So: the DER header the IC
+        // puts on every BLS key, and a raw key the verifier can strip whole.
+        const DER_HEADER: &[u8] =
+            b"\x30\x81\x82\x30\x1d\x06\x0d\x2b\x06\x01\x04\x01\x82\xdc\x7c\x05\
+            \x03\x01\x02\x01\x06\x0c\x2b\x06\x01\x04\x01\x82\xdc\x7c\x05\x03\x02\x01\x03\x61\x00";
+        assert_eq!(IC_MAINNET_ROOT_KEY.len(), DER_HEADER.len() + BLS_KEY_LEN);
+        assert_eq!(&IC_MAINNET_ROOT_KEY[..DER_HEADER.len()], DER_HEADER);
     }
 }

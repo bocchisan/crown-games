@@ -11,22 +11,38 @@ mod tests {
     fn testnet_values_are_baked() {
         assert_eq!(PROFILE, "testnet");
         assert_eq!(CROWN_INDEX, "aaaaa-aa");
-        assert_eq!(THRESHOLD_KEY, "dfx_test_key");
+        assert_eq!(THRESHOLD_KEY, "key_1");
         assert_eq!(VOTING_PERIOD, 120);
         assert_eq!(MIN_GROSS, 1_860_000);
         assert_eq!(SIGN_PRICE, 26_200_000_000);
+        assert_eq!(ROOT_PRICE, 1_000_000_000);
         assert_eq!(FEE_BPS, 300);
         assert_eq!(CHAIN_ID, "devnet");
         assert_eq!(DOMAIN, "crown:two-outcome:devnet");
-        // fee_wallet / factory are still placeholders on testnet → unset.
-        assert_eq!(FEE_WALLET, [0u8; 32]);
-        assert_eq!(FACTORY, [0u8; 32]);
+        // fee_wallet / factory are the **real** devnet addresses: the escrow
+        // address commits both (harness §9), so a placeholder here derives
+        // addresses no birth can ever live at — and the refusal reads as a bad
+        // proof rather than a bad config. Pinned by the live runs (T5/A5/F5).
+        assert_eq!(
+            FEE_WALLET,
+            b58("FS6ZNuPxXqWSGzwXEQpfoxikDksbEzmrXGZDFXmFj6vS")
+        );
+        assert_eq!(FACTORY, b58("BGVQrwSwkFQspL69DjGBFgKSgL6rutPqgcgEskmi8A4y"));
     }
 
-    #[test]
-    fn game_floor_is_at_least_index_min_gross() {
-        // Alignment invariant (cost.md §6): the game floor must be ≥ the index's.
-        let index_min_gross: u64 = 200_000;
-        assert!(MIN_GROSS >= index_min_gross);
+    // **Нет теста «игровой флор ≥ индексного», и это решение.** Он существовал и
+    // сравнивал `MIN_GROSS` с литералом `200_000`, вписанным рядом, — то есть с
+    // копией индексного флора, живущей в этом же файле. Покраснеть при том
+    // событии, ради которого он написан (индекс поднял свой флор), он не мог
+    // физически: литерал в чужом репе не двигается. Сделать его настоящим —
+    // значит завести build-зависимость на конфиг `crown-indexer`, а репы
+    // независимы by design (`repo-map.md`). Инвариант никуда не делся, но живёт
+    // там, где его можно проверить: шагом cost-gate в `07-build-plan.md §P8`,
+    // где оба числа перемеряются разом. Правило проекта — проверка, не способная
+    // покраснеть, хуже отсутствующей (`P7.5`, `P7.13`).
+
+    /// base58 → 32 bytes, for pinning the baked addresses above.
+    fn b58(s: &str) -> [u8; 32] {
+        bs58::decode(s).into_vec().unwrap().try_into().unwrap()
     }
 }

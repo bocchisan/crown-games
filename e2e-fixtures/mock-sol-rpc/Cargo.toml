@@ -1,8 +1,11 @@
 # Test fixture — a stand-in for the DFINITY SOL RPC canister
 # (`tghme-zyaaa-aaaar-qarca-cai`). The index calls its `getTransaction`; here we
 # return a pre-set reply (a real/synthetic `create_escrow` tx) so `ingest` records
-# a birth without a live outcall. Reuses the index's own candid types for an exact
-# match. Detached from the parent workspace via an empty `[workspace]`.
+# a birth without a live outcall. **No `crown-indexer` dependency**: a canister
+# crate linked as a library exports its own endpoints and hooks into this wasm
+# (`inspect_message` above all) — see `src/lib.rs`. The reply is raw candid bytes,
+# encoded by the test with the index's own types, so exactness is unchanged.
+# Detached from the parent workspace via an empty `[workspace]`.
 [package]
 name = "mock-sol-rpc"
 version = "0.1.0"
@@ -15,6 +18,5 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 candid = "0.10"
 ic-cdk = "0.20"
-crown-indexer = { path = "../../../../crown-indexer" }
 
 [workspace]

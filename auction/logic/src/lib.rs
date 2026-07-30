@@ -17,7 +17,7 @@ pub mod verdict;
 
 pub use deadline::min_deadline;
 pub use machine::{
-    resolve, step, Action, Auction, Known, Outcome, Resolution, State, StepError, Vote,
+    resolve, step, Action, ActionKind, Auction, Known, Outcome, Resolution, State, StepError, Vote,
 };
 pub use verdict::verdict;
 

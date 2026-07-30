@@ -207,11 +207,13 @@ dependencies = [
  "crown-derive",
  "crown-salt",
  "ed25519-dalek",
+ "hex",
  "ic-certification",
  "ic-certified-map",
  "ic-ed25519",
  "ic-verify-bls-signature",
  "serde_cbor",
+ "sha2",
 ]
 
 [[package]]

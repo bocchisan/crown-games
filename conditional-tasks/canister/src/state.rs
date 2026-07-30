@@ -3,7 +3,6 @@
 //! survive an upgrade. The update methods are thin `ic_cdk` wrappers over these
 //! pure operations, which are host-testable.
 
-use crate::validate::Profile;
 use conditional_tasks_logic::{step, Action, Outcome, State, StepError, Task, Vote};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -17,17 +16,24 @@ struct Stored {
     text_hash: [u8; 32],
 }
 
-/// A recipient profile plus its strictly-increasing counter.
-#[derive(Clone, Copy)]
-struct StoredProfile {
-    profile: Profile,
-    counter: u64,
-}
+// The verdict signature store and its claim-before-await discipline live in
+// `crown_games_common::signing` — non-negativity invariant #5, one mechanism
+// for every game rather than three byte-identical copies (`P7.6`).
+pub use crown_games_common::signing::SignedVerdict;
+
+// There is no recipient-profile table. Acceptance terms (a minimum, a "not
+// accepting") are a display filter, and the canister is the one place where the
+// filter can no longer help: `register_task` needs a birth proof, so by the time
+// it could refuse, the donor has already funded the escrow and paid for the
+// birth ingest and the root push. Refusing there costs the donor three paid
+// steps and protects nobody — an unwanted task is declined, or simply ignored
+// until `refund()` returns the money at the deadline. Terms belong in front of
+// the escrow, i.e. in the client. Removing the table also removes the one write
+// with no escrow behind it, so `00 §11` ("ни одного хранимого байта без
+// реального эскроу") now holds without exception (`P7.14`).
 
 thread_local! {
     static TASKS: RefCell<BTreeMap<[u8; 32], Stored>> = const { RefCell::new(BTreeMap::new()) };
-    static PROFILES: RefCell<BTreeMap<[u8; 32], StoredProfile>> =
-        const { RefCell::new(BTreeMap::new()) };
 }
 
 /// State-level errors of an update.
@@ -36,20 +42,8 @@ pub enum StateError {
     AlreadyExists,
     NotFound,
     NotRecipient,
-    StaleCounter,
     VoteCapReached,
-    ProfileCapReached,
     Step(StepError),
-}
-
-/// The lazy default profile (harness §Профиль): enabled, `min_gross = floor`,
-/// no reputation gate, counter 0.
-pub fn default_profile(floor: u64) -> Profile {
-    Profile {
-        enabled: true,
-        min_gross: floor,
-        min_reputation: 0,
-    }
 }
 
 /// Materialize a task. Idempotent by `task_id` — a duplicate is rejected (a
@@ -91,6 +85,39 @@ pub fn recipient_action(
         }
         step(&mut s.task, action, now).map_err(StateError::Step)?;
         Ok(s.task.state)
+    })
+}
+
+/// Time-free boundary pre-check for a recipient action (harness §6), the twin of
+/// [`vote_admits`]: the cheap committed-state reasons the action is doomed —
+/// unknown task, wrong signer, or a stored state whose transition table does not
+/// admit it.
+///
+/// Sound on the time-free boundary for the same reason `vote_admits` is: the only
+/// move time can make is into `Decided`, which admits nothing, so an action the
+/// stored state refuses is refused in every state time could have produced
+/// (`conditional_tasks_logic::State::admits`, pinned to `apply_action` by an
+/// exhaustive test). A strict subset of `recipient_action`'s rejections, which
+/// stays the authoritative gate.
+///
+/// Without this the boundary admitted every action from the right signer and let
+/// the update reject it — so a recipient (or anyone replaying their signed
+/// message, since the extras are unsigned) could repeat `accept` forever and have
+/// each copy executed, replicated, at the canister's expense.
+pub fn action_admits(
+    task_id: &[u8; 32],
+    signer: &[u8; 32],
+    action: &Action,
+) -> Result<(), StateError> {
+    TASKS.with_borrow(|t| {
+        let s = t.get(task_id).ok_or(StateError::NotFound)?;
+        if s.recipient != *signer {
+            return Err(StateError::NotRecipient);
+        }
+        if !s.task.state.admits(action) {
+            return Err(StateError::Step(StepError::InvalidTransition));
+        }
+        Ok(())
     })
 }
 
@@ -170,57 +197,6 @@ pub fn text_hash(task_id: &[u8; 32]) -> Option<[u8; 32]> {
     TASKS.with_borrow(|t| t.get(task_id).map(|s| s.text_hash))
 }
 
-/// Whether a profile write would be admitted (read-only): the counter strictly
-/// increases for an existing recipient, and the table has room for a new one.
-/// The boundary (`inspect_message`) uses it to drop a doomed `set_profile` for
-/// free; `set_profile` re-checks it before writing.
-pub fn profile_admits(recipient: &[u8; 32], counter: u64, max: usize) -> Result<(), StateError> {
-    PROFILES.with_borrow(|p| match p.get(recipient) {
-        Some(existing) if counter <= existing.counter => Err(StateError::StaleCounter),
-        Some(_) => Ok(()),
-        None if p.len() >= max => Err(StateError::ProfileCapReached),
-        None => Ok(()),
-    })
-}
-
-/// Set a recipient's profile — the counter must strictly increase. Capped at
-/// `max` distinct recipients: `set_profile` is the one write not gated by a
-/// birth proof (any freshly-signed key can call it), so an unbounded `PROFILES`
-/// would let anyone inflate heap state for free. An *existing* recipient updates
-/// in place (no net growth); a *new* recipient is refused once the table is full
-/// (non-negativity invariant #7, cost.md §6 — same shape as the per-area `V_MAX`
-/// vote cap).
-pub fn set_profile(
-    recipient: [u8; 32],
-    profile: Profile,
-    counter: u64,
-    max: usize,
-) -> Result<(), StateError> {
-    profile_admits(&recipient, counter, max)?;
-    PROFILES.with_borrow_mut(|p| {
-        p.insert(recipient, StoredProfile { profile, counter });
-    });
-    Ok(())
-}
-
-/// The effective profile plus its counter (0 if the recipient has none set).
-pub fn profile_and_counter(recipient: &[u8; 32], floor: u64) -> (Profile, u64) {
-    PROFILES.with_borrow(|p| {
-        p.get(recipient)
-            .map(|sp| (sp.profile, sp.counter))
-            .unwrap_or_else(|| (default_profile(floor), 0))
-    })
-}
-
-/// The effective profile for a recipient (the default if unset).
-pub fn profile(recipient: &[u8; 32], floor: u64) -> Profile {
-    PROFILES.with_borrow(|p| {
-        p.get(recipient)
-            .map(|sp| sp.profile)
-            .unwrap_or_else(|| default_profile(floor))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,8 +215,13 @@ mod tests {
 
     fn reset() {
         TASKS.with_borrow_mut(BTreeMap::clear);
-        PROFILES.with_borrow_mut(BTreeMap::clear);
+        crown_games_common::signing::reset_for_test();
     }
+
+    // The signature store's own behaviour — repeat served free, one claim at a
+    // time, an aborted signing left retriable — is tested once, in
+    // `crown_games_common::signing`. Re-testing it per game re-tested one
+    // mechanism three times and told us nothing about this game (`P7.6`).
 
     #[test]
     fn materialize_is_idempotent() {
@@ -330,46 +311,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn profile_counter_must_increase() {
-        reset();
-        let r = [5u8; 32];
-        let floor = 1_860_000;
-        // Default until set.
-        assert_eq!(profile(&r, floor), default_profile(floor));
-
-        let p = Profile {
-            enabled: false,
-            min_gross: floor + 1,
-            min_reputation: 7,
-        };
-        assert_eq!(set_profile(r, p, 1, 500), Ok(()));
-        assert_eq!(profile(&r, floor), p);
-        // Equal or lower counter is stale.
-        assert_eq!(set_profile(r, p, 1, 500), Err(StateError::StaleCounter));
-        assert_eq!(set_profile(r, p, 0, 500), Err(StateError::StaleCounter));
-        // A higher counter updates.
-        let p2 = Profile { enabled: true, ..p };
-        assert_eq!(set_profile(r, p2, 2, 500), Ok(()));
-        assert_eq!(profile(&r, floor), p2);
-    }
-
-    #[test]
-    fn profiles_are_capped_but_existing_recipients_still_update() {
-        reset();
-        let p = default_profile(1_860_000);
-        // Fill the table to a cap of 2 with two distinct recipients.
-        assert_eq!(set_profile([1u8; 32], p, 1, 2), Ok(()));
-        assert_eq!(set_profile([2u8; 32], p, 1, 2), Ok(()));
-        // A third, new recipient is refused — no free unbounded growth.
-        assert_eq!(
-            set_profile([3u8; 32], p, 1, 2),
-            Err(StateError::ProfileCapReached)
-        );
-        // But an already-stored recipient may still update in place (no growth).
-        assert_eq!(set_profile([1u8; 32], p, 2, 2), Ok(()));
-    }
-
     fn voting_task(id: [u8; 32], recipient: [u8; 32]) {
         let mut task = fresh_task();
         task.state = State::Voting { started_at: 0 };
@@ -426,6 +367,85 @@ mod tests {
             add_vote(&[7u8; 32], vote(1, 200_000, true), 0, 500),
             Err(StateError::NotFound)
         );
+    }
+
+    /// The boundary must refuse a doomed recipient action, not leave it to the
+    /// update. This is the check whose absence let one signed `accept` be
+    /// replayed forever at the canister's expense.
+    #[test]
+    fn action_admits_refuses_what_the_state_will_refuse() {
+        reset();
+        let id = [1u8; 32];
+        let recipient = [9u8; 32];
+
+        // Unknown task → NotFound, before anything else.
+        assert_eq!(
+            action_admits(&id, &recipient, &Action::Accept),
+            Err(StateError::NotFound)
+        );
+
+        materialize(id, fresh_task(), recipient, [3; 32]).unwrap();
+        // A stranger is refused even for an action the state does admit.
+        assert_eq!(
+            action_admits(&id, &[8u8; 32], &Action::Accept),
+            Err(StateError::NotRecipient)
+        );
+        // `Created` admits accept/decline, not ready.
+        assert_eq!(action_admits(&id, &recipient, &Action::Accept), Ok(()));
+        assert_eq!(action_admits(&id, &recipient, &Action::Decline), Ok(()));
+        assert_eq!(
+            action_admits(&id, &recipient, &Action::Ready),
+            Err(StateError::Step(StepError::InvalidTransition))
+        );
+
+        // After accept, a *second* accept is doomed — and now dies here, at the
+        // boundary, instead of being executed and refused by the update.
+        recipient_action(&id, &recipient, Action::Accept, 0).unwrap();
+        assert_eq!(
+            action_admits(&id, &recipient, &Action::Accept),
+            Err(StateError::Step(StepError::InvalidTransition))
+        );
+        assert_eq!(action_admits(&id, &recipient, &Action::Ready), Ok(()));
+
+        // Decided is absorbing: nothing is admitted, ever.
+        recipient_action(&id, &recipient, Action::Decline, 0).unwrap();
+        for a in [Action::Accept, Action::Decline, Action::Ready] {
+            assert_eq!(
+                action_admits(&id, &recipient, &a),
+                Err(StateError::Step(StepError::InvalidTransition)),
+                "{a:?} must be refused on a decided task"
+            );
+        }
+    }
+
+    /// Every rejection the boundary makes must be one the update would also
+    /// make — otherwise a legitimate call is dropped for free and looks to the
+    /// client like a refusal without a reason.
+    #[test]
+    fn action_admits_never_refuses_what_the_update_would_accept() {
+        for (setup, action) in [
+            (None, Action::Accept),
+            (None, Action::Decline),
+            (Some(Action::Accept), Action::Ready),
+            (Some(Action::Accept), Action::Decline),
+        ] {
+            reset();
+            let id = [1u8; 32];
+            let recipient = [9u8; 32];
+            materialize(id, fresh_task(), recipient, [3; 32]).unwrap();
+            if let Some(pre) = setup {
+                recipient_action(&id, &recipient, pre, 0).unwrap();
+            }
+            assert_eq!(
+                action_admits(&id, &recipient, &action),
+                Ok(()),
+                "boundary refused {action:?}, which the update accepts"
+            );
+            assert!(
+                recipient_action(&id, &recipient, action.clone(), 0).is_ok(),
+                "update refused {action:?} the boundary admitted"
+            );
+        }
     }
 
     #[test]

@@ -129,6 +129,61 @@ fn advance(a: &mut Auction, now: u64) -> Result<(), StepError> {
     Ok(())
 }
 
+/// The *kind* of an action, without the parameters the canister derives from
+/// stored state (`is_winner`, `is_winner_lot`, `lot_id`). The boundary knows the
+/// kind from the signed `action` field alone — the flags are the update's job,
+/// which is exactly why [`State::admits`] is expressed over kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    RegisterEntry,
+    AcceptLot,
+    ReturnLot,
+    ReturnEntry,
+    PickWinner,
+    CancelAuction,
+    Ready,
+    Vote,
+}
+
+impl State {
+    /// Whether this state admits **any** action of `kind` — the time-free,
+    /// parameter-free half of `apply_action`'s verdict, for the boundary
+    /// (`games-harness.md §6`).
+    ///
+    /// Conservative on two axes, and it has to be on both:
+    ///
+    /// - **Time.** Answered against the stored, un-advanced state. `Bidding`
+    ///   never leaves itself by the clock; `Performing`/`Voting` leave only for
+    ///   `Done`, which admits nothing; and the `open` guard inside `Bidding` only
+    ///   ever goes true → false. So no action becomes admissible later, and a
+    ///   `false` here is doomed for every `now`.
+    /// - **Parameters.** `ReturnLot`/`ReturnEntry` carry a winner flag the
+    ///   canister reads from state, so a kind is admitted if *some* flag would
+    ///   be — the boundary must not guess the flag and refuse a valid call.
+    ///
+    /// A `true` is therefore a filter, never a verdict: the update still advances
+    /// the clock, resolves the flags, and may refuse. A `false` is exact.
+    pub fn admits(&self, kind: ActionKind) -> bool {
+        use ActionKind as K;
+        match self {
+            State::Bidding => matches!(
+                kind,
+                K::RegisterEntry
+                    | K::AcceptLot
+                    | K::ReturnLot
+                    | K::ReturnEntry
+                    | K::PickWinner
+                    | K::CancelAuction
+            ),
+            // The winner lot may be returned, and its entries with it; `ready`
+            // opens voting. Nothing else survives the bidding window.
+            State::Performing => matches!(kind, K::Ready | K::ReturnLot | K::ReturnEntry),
+            State::Voting { .. } => matches!(kind, K::Vote),
+            State::Done { .. } => false,
+        }
+    }
+}
+
 /// Apply an action to the (already advanced) state. `register`/`accept`/`return`
 /// are lot bookkeeping the canister performs; the machine gates them by state
 /// **and** the bidding window (`now < T`). `pick_winner`/`cancel` stay open while
@@ -259,6 +314,139 @@ mod tests {
             voting_period: VP,
             winner_lot: None,
             votes: Vec::new(),
+        }
+    }
+
+    /// `State::admits` gates the boundary; `apply_action` gates the update. The
+    /// asymmetry between them is deliberate (admission filters, refusal decides),
+    /// so this pins the direction that actually protects us: **whatever `admits`
+    /// refuses, `apply_action` must refuse too — for every parameterisation of
+    /// the action and at every point in the clock.** A gap there is a doomed call
+    /// admitted, executed replicated and billed to the canister.
+    ///
+    /// Enumerated, not sampled: 4 states × 8 kinds, each kind expanded to every
+    /// concrete `Action`, each tried inside the bidding window and past it.
+    #[test]
+    fn whatever_admits_refuses_apply_action_refuses_at_every_clock() {
+        use ActionKind as K;
+        let states = [
+            State::Bidding,
+            State::Performing,
+            State::Voting {
+                started_at: CREATED,
+            },
+            State::Done { winner: None },
+            State::Done {
+                winner: Some(Outcome::Settle),
+            },
+        ];
+        // Every kind, expanded to every concrete action it can become.
+        let expansions: [(ActionKind, Vec<Action>); 8] = [
+            (K::RegisterEntry, vec![Action::RegisterEntry]),
+            (K::AcceptLot, vec![Action::AcceptLot]),
+            (
+                K::ReturnLot,
+                vec![
+                    Action::ReturnLot { is_winner: false },
+                    Action::ReturnLot { is_winner: true },
+                ],
+            ),
+            (
+                K::ReturnEntry,
+                vec![
+                    Action::ReturnEntry {
+                        is_winner_lot: false,
+                    },
+                    Action::ReturnEntry {
+                        is_winner_lot: true,
+                    },
+                ],
+            ),
+            (K::PickWinner, vec![Action::PickWinner { lot_id: [7; 32] }]),
+            (K::CancelAuction, vec![Action::CancelAuction]),
+            (K::Ready, vec![Action::Ready]),
+            (K::Vote, vec![Action::Vote(vote(1, MIN_VOTE_WEIGHT, true))]),
+        ];
+        // Inside the bidding window, and after it closed — `open` flips between.
+        let clocks = [CREATED, CREATED + DUR + PW + VP + 1];
+
+        for s in states {
+            for (kind, actions) in &expansions {
+                for a in actions {
+                    for now in clocks {
+                        let mut auc = auction(s.clone());
+                        let applied = step(&mut auc, a.clone(), now);
+                        if !s.admits(*kind) {
+                            assert_eq!(
+                                applied,
+                                Err(StepError::InvalidTransition),
+                                "admits() refused {kind:?} in {s:?}, but apply_action \
+                                 accepted {a:?} at now={now}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The other direction, stated as coverage rather than equality: every kind
+    /// `admits` allows must be genuinely reachable somewhere, or the boundary is
+    /// merely permissive and proves nothing. Catches an `admits` that drifted
+    /// into `true` for a transition the machine no longer has.
+    #[test]
+    fn every_admitted_kind_is_reachable_in_that_state() {
+        use ActionKind as K;
+        let cases = [
+            (State::Bidding, K::RegisterEntry, Action::RegisterEntry),
+            (State::Bidding, K::AcceptLot, Action::AcceptLot),
+            (
+                State::Bidding,
+                K::ReturnLot,
+                Action::ReturnLot { is_winner: false },
+            ),
+            (
+                State::Bidding,
+                K::ReturnEntry,
+                Action::ReturnEntry {
+                    is_winner_lot: false,
+                },
+            ),
+            (
+                State::Bidding,
+                K::PickWinner,
+                Action::PickWinner { lot_id: [7; 32] },
+            ),
+            (State::Bidding, K::CancelAuction, Action::CancelAuction),
+            (State::Performing, K::Ready, Action::Ready),
+            (
+                State::Performing,
+                K::ReturnLot,
+                Action::ReturnLot { is_winner: true },
+            ),
+            (
+                State::Performing,
+                K::ReturnEntry,
+                Action::ReturnEntry {
+                    is_winner_lot: true,
+                },
+            ),
+            (
+                State::Voting {
+                    started_at: CREATED,
+                },
+                K::Vote,
+                Action::Vote(vote(1, MIN_VOTE_WEIGHT, true)),
+            ),
+        ];
+        for (s, kind, a) in cases {
+            assert!(s.admits(kind), "{kind:?} must be admitted in {s:?}");
+            let mut auc = auction(s.clone());
+            assert_eq!(
+                step(&mut auc, a.clone(), CREATED),
+                Ok(()),
+                "{a:?} must be applicable in {s:?} — otherwise admits() is vacuous"
+            );
         }
     }
 
