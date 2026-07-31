@@ -91,7 +91,7 @@ fn signed_request(sk: &SigningKey, message: &str, extras: &[(&str, String)]) -> 
 // crown-indexer `config/testnet.toml`. Must track it: the index accepts nothing
 // below its own INGEST_PRICE, so a stale value here reads as `Underpaid` and the
 // ingest silently folds nothing.
-const INGEST_PRICE: u128 = 13_700_000_000;
+const INGEST_PRICE: u128 = 17_000_000_000;
 const SOL_RPC: [u8; 10] = [0, 0, 0, 0, 2, 48, 4, 68, 1, 1]; // tghme-zyaaa-aaaar-qarca-cai
 const TWO_OUTCOME_FACTORY: &str = "BGVQrwSwkFQspL69DjGBFgKSgL6rutPqgcgEskmi8A4y"; // pinned in the index
 

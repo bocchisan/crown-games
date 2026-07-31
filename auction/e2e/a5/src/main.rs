@@ -86,7 +86,7 @@ const CANCEL: u8 = 1;
 const SEP: &str = "\n---\n";
 /// `crown-indexer/config/testnet.toml`. The index refuses anything below its own
 /// price, and an `Underpaid` ingest folds nothing while looking like a no-op.
-const INGEST_PRICE: u128 = 13_700_000_000;
+const INGEST_PRICE: u128 = 17_000_000_000;
 /// The index's pinned SOL RPC principal (`tghme-zyaaa-aaaar-qarca-cai`).
 const SOL_RPC: [u8; 10] = [0, 0, 0, 0, 2, 48, 4, 68, 1, 1];
 /// How far the linear slot→time model may sit from the network before the anchor

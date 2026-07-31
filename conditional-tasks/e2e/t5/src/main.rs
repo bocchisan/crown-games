@@ -66,7 +66,7 @@ const DURATION: u64 = 100_000;
 // port that here rather than trusting these two lines to stay in sync.
 const VOTING_PERIOD: u64 = 120;
 const FEE_BPS: u16 = 300;
-const INGEST_PRICE: u128 = 13_700_000_000;
+const INGEST_PRICE: u128 = 17_000_000_000;
 const ROOT_PRICE: u128 = 1_000_000_000;
 const SIGN_PRICE: u128 = 26_200_000_000;
 const CANCEL: u8 = 1;
