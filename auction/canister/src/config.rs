@@ -19,15 +19,12 @@ pub fn slot_to_created_at(slot: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use auction_logic::{MAX_DURATION, MIN_DURATION};
 
     #[test]
     fn testnet_values_are_baked() {
         assert_eq!(PROFILE, "testnet");
         assert_eq!(CROWN_INDEX, "aaaaa-aa");
         assert_eq!(THRESHOLD_KEY, "key_1");
-        assert_eq!(VOTING_PERIOD, 120);
-        assert_eq!(PERFORM_WINDOW, 120);
         assert_eq!(MIN_ENTRY, 250_000);
         assert_eq!(SIGN_PRICE, 26_200_000_000);
         assert_eq!(ROOT_PRICE, 1_000_000_000);
@@ -63,17 +60,12 @@ mod tests {
     // где оба числа перемеряются разом. Правило проекта — проверка, не способная
     // покраснеть, хуже отсутствующей (`P7.5`, `P7.13`).
 
-    #[test]
-    fn timings_are_within_the_logic_bounds() {
-        // Deploy invariant: voting_period/perform_window ∈ [MIN_DURATION, MAX_DURATION].
-        let (vp, pw) = (
-            std::hint::black_box(VOTING_PERIOD),
-            std::hint::black_box(PERFORM_WINDOW),
-        );
-        let range = MIN_DURATION..=MAX_DURATION;
-        assert!(range.contains(&vp));
-        assert!(range.contains(&pw));
-    }
+    // **Нет теста «тайминги в границах логики», и это следствие переработки.** Он
+    // проверял `VOTING_PERIOD`/`PERFORM_WINDOW` — обе константы исчезли вместе с
+    // голосованием и окном выполнения. Единственный оставшийся тайминг,
+    // `duration`, приходит не из конфига, а из прообраза `auction_id`, и его
+    // диапазон проверяется на материализации (`validate::validate_ranges`), где
+    // его и можно нарушить.
 
     #[test]
     fn slot_to_created_at_is_linear_and_checked() {

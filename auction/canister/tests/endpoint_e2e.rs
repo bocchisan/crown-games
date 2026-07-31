@@ -14,9 +14,9 @@
 //! What is covered (no proof forging, no devnet): `request_signature` charges
 //! nothing without a verdict (`Underpaid` below `SIGN_PRICE`, `WrongTarget` on a
 //! wrong chain, `NotFound` for an unknown auction); `inspect_message` drops a
-//! malformed `vote` ingress before execution; and the queries wire through.
-//! Still out of scope (needs proof forging / devnet): birth-proof `register_entry`,
-//! the vote weight-proof gate, and `Signed`/settle/refund money movement.
+//! malformed recipient-action ingress before execution; and the queries wire
+//! through. Still out of scope (needs proof forging / devnet): birth-proof
+//! `register_entry`, and `Signed`/settle/refund money movement.
 
 use auction::{AuctionResult, InitArgs};
 use candid::{Decode, Encode, Principal};
@@ -216,14 +216,48 @@ fn a_register_entry_with_a_witness_but_no_cached_root_is_refused() {
 }
 
 #[test]
-fn inspect_message_drops_a_malformed_vote() {
+fn inspect_message_drops_malformed_recipient_actions() {
     let (pic, auction, _proxy) = setup();
-    // A `vote` whose payload is not an admissible signed request is rejected at the
-    // boundary — the update never runs (the non-negativity invariant: an invalid
-    // vote does not reach paid execution).
-    let arg = Encode!(&"not-a-valid-signed-vote".to_string()).unwrap();
-    let res = pic.update_call(auction, Principal::anonymous(), "vote", arg);
-    assert!(res.is_err(), "inspect_message must drop the malformed vote");
+    // A recipient action whose payload is not an admissible signed request is
+    // rejected at the boundary — the update never runs (the non-negativity
+    // invariant: an invalid action does not reach replicated execution). Every
+    // one of them, since each is a free flood template otherwise.
+    for method in ["cancel_auction", "accept_lot", "return_lot", "return_entry"] {
+        let arg = Encode!(&"not-a-valid-signed-action".to_string()).unwrap();
+        let res = pic.update_call(auction, Principal::anonymous(), method, arg);
+        assert!(
+            res.is_err(),
+            "inspect_message must drop a malformed {method}"
+        );
+    }
+}
+
+#[test]
+fn the_removed_methods_are_gone_from_the_interface() {
+    let (pic, auction, _proxy) = setup();
+    // The vote and the recipient's pick are not "disabled", they do not exist:
+    // a call to either is rejected as an unknown method. Pins the .did surface
+    // against a stale client that still tries to steer the winner.
+    for method in ["vote", "pick_winner", "ready"] {
+        let arg = Encode!(&"anything".to_string()).unwrap();
+        let res = pic.update_call(auction, Principal::anonymous(), method, arg);
+        assert!(res.is_err(), "{method} must not exist on the canister");
+    }
+    // `get_auction_id` went the same way, for a different reason worth pinning: it
+    // had no consumer at all. It echoed a hash of the very fields the caller
+    // presents, and the signature it verified added nothing — a fresh key signs
+    // its own message. Not a cost argument: a query is `$0` (`cost.md §1`). The
+    // reference game never had it.
+    let res = pic.query_call(
+        auction,
+        Principal::anonymous(),
+        "get_auction_id",
+        Encode!(&"anything".to_string()).unwrap(),
+    );
+    assert!(
+        res.is_err(),
+        "get_auction_id must not exist on the canister"
+    );
 }
 
 #[test]
@@ -238,7 +272,7 @@ fn queries_wire_through() {
             Encode!().unwrap(),
         )
         .expect("get_logic_version");
-    assert_eq!(Decode!(&v, u32).unwrap(), 1);
+    assert_eq!(Decode!(&v, u32).unwrap(), 2); // arithmetic close, no vote
 
     // An unknown auction has no state view.
     let (a, _, _) = ids();

@@ -25,10 +25,6 @@ use solana_sdk::{
 };
 
 const GAME_WASM: &str = "../target/e2e/wasm32-unknown-unknown/release/auction.wasm";
-// `config/testnet.toml` — baked into `auction_id`, so the test must use the same
-// values the canister does or the id it recomputes will not match.
-const VOTING_PERIOD: u64 = 120;
-const PERFORM_WINDOW: u64 = 120;
 // The platform floor (`config::MIN_ENTRY`); an auction may raise it, never lower
 // it, and it enters `auction_id`.
 const MIN_ENTRY: u64 = 1_860_000;
@@ -381,8 +377,6 @@ fn register_cancel_and_sign_a_real_verdict() {
         recipient,
         recipient_nonce,
         duration,
-        PERFORM_WINDOW,
-        VOTING_PERIOD,
         MIN_ENTRY,
     );
     let auction_hex = hex::encode(auction_id);
@@ -510,8 +504,6 @@ fn register_cancel_and_sign_a_real_verdict() {
         ("recipient", bs58::encode(recipient).into_string()),
         ("recipient_nonce", recipient_nonce.to_string()),
         ("duration", duration.to_string()),
-        ("perform_window", PERFORM_WINDOW.to_string()),
-        ("voting_period", VOTING_PERIOD.to_string()),
         ("min_entry", MIN_ENTRY.to_string()),
         ("gross", gross.to_string()),
         ("deadline", deadline.to_string()),
@@ -574,7 +566,7 @@ fn register_cancel_and_sign_a_real_verdict() {
         .expect("get_auction");
     assert!(matches!(
         Decode!(&aq, Option<AuctionStateView>).unwrap(),
-        Some(AuctionStateView::Bidding)
+        Some(AuctionStateView::Bidding { .. })
     ));
 
     // Recipient cancels the auction → `Done{None}`; every entry resolves to Cancel
@@ -592,7 +584,7 @@ fn register_cancel_and_sign_a_real_verdict() {
     assert!(
         matches!(
             Decode!(&dr, AuctionResult).unwrap(),
-            AuctionResult::Advanced(AuctionStateView::DoneNoWinner)
+            AuctionResult::Advanced(AuctionStateView::Done { winner_lot: None })
         ),
         "cancel_auction ends the auction with no winner"
     );

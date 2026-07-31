@@ -1,43 +1,57 @@
 //! Canister state + orchestration (in-memory). A new version is a fresh canister
-//! (harness §7 bars migration), so heap state is correct. Blind and registryless
-//! at the escrow level: an auction holds its lots, a lot holds its confirmed
-//! entries (each escrow carries its own leaf scope `resolver = key([entry_id])`,
-//! so a verdict names exactly one escrow — a lot is only a contest group). The
-//! machine (`auction-logic`) gates by auction state; the value/role gates live
-//! here — `gross ≥ min_entry` (in `validate`), lot-not-returned, accept-not-
-//! already-accepted, entry-not-returned, and pick-must-be-an-accepted-lot.
-//! Host-testable pure operations under thin `ic_cdk` wrappers.
+//! (harness §7 bars migration), so heap state is correct. Registryless at the
+//! escrow level: an auction holds its lots, a lot holds its confirmed entries
+//! (each escrow carries its own leaf scope `resolver = key([entry_id])`, so a
+//! verdict names exactly one escrow — a lot is the contest group). The machine
+//! (`auction-logic`) gates by auction state; the value/role gates live here —
+//! `gross ≥ min_entry` (in `validate`), lot-not-returned, accept-not-already-
+//! accepted, entry-not-returned. Host-testable pure operations under thin
+//! `ic_cdk` wrappers.
+//!
+//! The winner is arithmetic, so unlike every other game here the canister is
+//! **not** blind to amounts: a confirmed entry stores its `gross` and its lot
+//! keeps the running `total`. Both are trustworthy without reading the chain —
+//! `gross` is committed by the escrow's address salt and the index only emits a
+//! birth for a `create_escrow` cross-checked against an executed transfer of
+//! exactly that amount, so a lied-about `gross` derives an address no birth
+//! lives at (`admit_register_entry`).
 
-use auction_logic::{step, Action, ActionKind, Auction, Known, State, StepError, Vote};
+use auction_logic::{step, tick, Action, Auction, Known, State, StepError};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-/// A confirmed contribution to a lot. The canister is blind to amounts: `gross`
-/// is validated against `min_entry` at `register_entry` and then not stored — the
-/// recipient sees sums on the off-canister board and picks the winner. Only the
-/// fields the three-stage resolution reads are kept: `returned` (liveness),
-/// `escrow` (identity/dedup), and `entry_id` — the entry's leaf scope, under which
-/// its verdict is signed (`resolver = key([entry_id])`).
+/// A confirmed contribution to a lot. Only the fields the resolution and the
+/// close read are kept: `returned` (liveness), `escrow` (identity/dedup),
+/// `entry_id` — the entry's leaf scope, under which its verdict is signed
+/// (`resolver = key([entry_id])`) — and `gross`, which is what it weighs at the
+/// close.
 #[derive(Clone)]
 struct StoredEntry {
     returned: Option<u64>,
     escrow: [u8; 32],
     entry_id: [u8; 32],
+    gross: u64,
 }
 
-/// A lot: its contest key (`lot_id`), its `text_hash`, and the confirmed entries.
-/// A lot holds no resolver — the resolver lives at the entry (its settlement leaf).
+/// A lot: its contest key (`lot_id`), its `text_hash`, the confirmed entries, and
+/// `total` — the sum of the live ones, which is what the close compares. A lot
+/// holds no resolver: the resolver lives at the entry (its settlement leaf).
+///
+/// `total` is maintained incrementally (add on a confirmed entry, subtract on a
+/// `return_entry`) rather than summed on demand, so the standing costs nothing to
+/// read and the close is one pass over lots instead of over every contribution.
 #[derive(Clone)]
 struct StoredLot {
     lot_id: [u8; 32],
     text_hash: [u8; 32],
     accepted_at: Option<u64>,
     returned: Option<u64>,
+    total: u128,
     entries: Vec<StoredEntry>,
 }
 
 /// A materialized auction: the logic machine, the recipient (authorizes
-/// accept/ready/return/cancel/pick), the `min_entry` snapshot, and the lots.
+/// accept/return/cancel), the `min_entry` snapshot, and the lots.
 #[derive(Clone)]
 struct StoredAuction {
     auction: Auction,
@@ -56,6 +70,19 @@ thread_local! {
         const { RefCell::new(BTreeMap::new()) };
 }
 
+/// An auction as a caller sees it: the state with the accrued close applied, plus
+/// `closes_at` — the instant the window shuts and the heaviest lot wins.
+///
+/// `closes_at` is on every reply and not just the query because it is the one
+/// number the whole game turns on and nothing else exposes it: `created_at` is
+/// fixed by the birth slot of whoever registered first, so the recipient's
+/// published `duration` does **not** tell a bidder how long is left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct View {
+    pub state: State,
+    pub closes_at: u64,
+}
+
 /// State-level errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateError {
@@ -65,11 +92,10 @@ pub enum StateError {
     LotNotFound,
     LotReturned,
     LotAlreadyAccepted,
-    LotNotAccepted,
     EntryNotFound,
     EntryReturned,
     DuplicateEscrow,
-    VoteCapReached,
+    TotalOverflow,
     Step(StepError),
 }
 
@@ -87,6 +113,54 @@ fn with_auction<R>(
 
 fn find_lot<'a>(s: &'a mut StoredAuction, lot_id: &[u8; 32]) -> Option<&'a mut StoredLot> {
     s.lots.iter_mut().find(|l| l.lot_id == *lot_id)
+}
+
+/// The winning lot: the eligible lot with the greatest live total. Eligible =
+/// accepted by the recipient, not returned, and still holding money (an accepted
+/// lot whose every entry was returned weighs nothing and cannot win a settle over
+/// an empty set of escrows).
+///
+/// One pass, and only ever at the close — the machine consults it lazily, and
+/// `Done` is absorbing, so it runs at most once per auction. The set it reads is
+/// frozen by then: every action that could move a total needs `Bidding`, which
+/// `now ≥ T` has already left. So the winner does not depend on which call
+/// happens to be the first one after `T`.
+///
+/// **Ties go to the lot that opened first** — the comparison is strict (`>`) over
+/// insertion order, i.e. the order of each lot's first confirmed entry. A later
+/// bid has to actually outbid, not merely match.
+fn top_lot(lots: &[StoredLot]) -> Option<[u8; 32]> {
+    let mut best: Option<&StoredLot> = None;
+    for l in lots {
+        if l.returned.is_some() || l.accepted_at.is_none() || l.total == 0 {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some(b) => l.total > b.total,
+        };
+        if better {
+            best = Some(l);
+        }
+    }
+    best.map(|l| l.lot_id)
+}
+
+/// Advance the clock, then apply `action`. The two field borrows are disjoint, so
+/// the machine can mutate the auction while the close scan reads the lots.
+/// The caller-visible view of an auction. `closes_at` saturates rather than
+/// checking: it is a display value, and the authoritative arithmetic is the
+/// machine's, which reports `Overflow` and refuses to move.
+fn view(s: &StoredAuction) -> View {
+    View {
+        state: s.auction.state.clone(),
+        closes_at: s.auction.created_at.saturating_add(s.auction.duration),
+    }
+}
+
+fn step_now(s: &mut StoredAuction, action: Action, now: u64) -> Result<(), StateError> {
+    let (auction, lots) = (&mut s.auction, &s.lots);
+    step(auction, action, now, || top_lot(lots)).map_err(StateError::Step)
 }
 
 // ---- materialization + entries ----
@@ -122,35 +196,31 @@ pub fn materialize(
 
 /// The auction's fixed `created_at` + rule snapshot (for the per-entry deadline
 /// check on a top-up), or `None` if unknown.
-pub fn timing(auction_id: &[u8; 32]) -> Option<(u64, u64, u64, u64, u64)> {
+pub fn timing(auction_id: &[u8; 32]) -> Option<(u64, u64, u64)> {
     AUCTIONS.with_borrow(|a| {
-        a.get(auction_id).map(|s| {
-            (
-                s.auction.created_at,
-                s.auction.duration,
-                s.auction.perform_window,
-                s.auction.voting_period,
-                s.min_entry,
-            )
-        })
+        a.get(auction_id)
+            .map(|s| (s.auction.created_at, s.auction.duration, s.min_entry))
     })
 }
 
-/// Add a confirmed entry to its lot (creating the lot on first sight). Gates:
-/// auction still `Bidding` before `T` (the machine `RegisterEntry` step), lot not
-/// returned, escrow not already present.
+/// Add a confirmed entry to its lot (creating the lot on first sight) and carry
+/// its `gross` into the lot's running total. Gates: auction still `Bidding` (the
+/// machine `RegisterEntry` step, which first applies the close), lot not returned,
+/// escrow not already present.
 pub fn add_entry(
     auction_id: &[u8; 32],
     text_hash: [u8; 32],
     lot_id: [u8; 32],
     entry_id: [u8; 32],
     escrow: [u8; 32],
+    gross: u64,
     now: u64,
 ) -> Result<(), StateError> {
     with_auction(auction_id, |s| {
-        // Machine gate: register only in Bidding before `T` (advances time first).
-        step(&mut s.auction, Action::RegisterEntry, now).map_err(StateError::Step)?;
-        // Escrow uniqueness across the auction (a duplicate birth proof is a no-op).
+        // Machine gate: register only while the window is open (`now < T`).
+        step_now(s, Action::RegisterEntry, now)?;
+        // Escrow uniqueness across the auction (a duplicate birth proof is a
+        // no-op — and would otherwise count one deposit toward the total twice).
         if s.lots
             .iter()
             .any(|l| l.entries.iter().any(|e| e.escrow == escrow))
@@ -161,12 +231,20 @@ pub fn add_entry(
             returned: None,
             escrow,
             entry_id,
+            gross,
         };
         match find_lot(s, &lot_id) {
             Some(lot) => {
                 if lot.returned.is_some() {
                     return Err(StateError::LotReturned); // no top-up into a returned lot
                 }
+                // Checked, and refused rather than clamped: a saturating total
+                // would silently tie at the ceiling and hand the close to the
+                // insertion-order tiebreak instead of to the larger bid.
+                lot.total = lot
+                    .total
+                    .checked_add(u128::from(gross))
+                    .ok_or(StateError::TotalOverflow)?;
                 lot.entries.push(entry);
             }
             None => s.lots.push(StoredLot {
@@ -174,6 +252,7 @@ pub fn add_entry(
                 text_hash,
                 accepted_at: None,
                 returned: None,
+                total: u128::from(gross),
                 entries: vec![entry],
             }),
         }
@@ -192,16 +271,17 @@ fn require_recipient(s: &StoredAuction, signer: &[u8; 32]) -> Result<(), StateEr
 }
 
 /// `accept_lot` (recipient): the lot must exist, be unaccepted and unreturned;
-/// gated `Bidding` by the machine. Sets `accepted_at = now`.
+/// gated `Bidding` by the machine. Sets `accepted_at = now`, which is what makes
+/// the lot eligible to win the close.
 pub fn accept_lot(
     auction_id: &[u8; 32],
     signer: &[u8; 32],
     lot_id: &[u8; 32],
     now: u64,
-) -> Result<State, StateError> {
+) -> Result<View, StateError> {
     with_auction(auction_id, |s| {
         require_recipient(s, signer)?;
-        step(&mut s.auction, Action::AcceptLot, now).map_err(StateError::Step)?;
+        step_now(s, Action::AcceptLot, now)?;
         let lot = find_lot(s, lot_id).ok_or(StateError::LotNotFound)?;
         if lot.returned.is_some() {
             return Err(StateError::LotReturned);
@@ -210,45 +290,44 @@ pub fn accept_lot(
             return Err(StateError::LotAlreadyAccepted);
         }
         lot.accepted_at = Some(now);
-        Ok(s.auction.state.clone())
+        Ok(view(s))
     })
 }
 
-/// `return_lot` (recipient): non-winner in `Bidding`, or the winner in
-/// `Performing` (→ `Done{Cancel}`). Marks the lot returned.
+/// `return_lot` (recipient): drop a lot out of the contest, only while `Bidding`.
+/// The lot stops being eligible to win and every one of its entries resolves
+/// `Cancel` (stage 2).
 pub fn return_lot(
     auction_id: &[u8; 32],
     signer: &[u8; 32],
     lot_id: &[u8; 32],
     now: u64,
-) -> Result<State, StateError> {
+) -> Result<View, StateError> {
     with_auction(auction_id, |s| {
         require_recipient(s, signer)?;
-        let is_winner = s.auction.winner_lot == Some(*lot_id);
-        step(&mut s.auction, Action::ReturnLot { is_winner }, now).map_err(StateError::Step)?;
+        step_now(s, Action::ReturnLot, now)?;
         let lot = find_lot(s, lot_id).ok_or(StateError::LotNotFound)?;
         if lot.returned.is_some() {
             return Err(StateError::LotReturned);
         }
         lot.returned = Some(now);
-        Ok(s.auction.state.clone())
+        Ok(view(s))
     })
 }
 
-/// `return_entry` (recipient): return one specific entry's escrow. Allowed on any
-/// lot in `Bidding`, or the winner lot in `Performing`.
+/// `return_entry` (recipient): return one specific entry's escrow, only while
+/// `Bidding`. Its `gross` leaves the lot's total, so a returned contribution
+/// stops counting toward the close.
 pub fn return_entry(
     auction_id: &[u8; 32],
     signer: &[u8; 32],
     lot_id: &[u8; 32],
     escrow: &[u8; 32],
     now: u64,
-) -> Result<State, StateError> {
+) -> Result<View, StateError> {
     with_auction(auction_id, |s| {
         require_recipient(s, signer)?;
-        let is_winner_lot = s.auction.winner_lot == Some(*lot_id);
-        step(&mut s.auction, Action::ReturnEntry { is_winner_lot }, now)
-            .map_err(StateError::Step)?;
+        step_now(s, Action::ReturnEntry, now)?;
         let lot = find_lot(s, lot_id).ok_or(StateError::LotNotFound)?;
         let entry = lot
             .entries
@@ -259,105 +338,30 @@ pub fn return_entry(
             return Err(StateError::EntryReturned);
         }
         entry.returned = Some(now);
-        Ok(s.auction.state.clone())
+        let gross = u128::from(entry.gross);
+        // Cannot underflow — every live entry's `gross` was added to `total` and
+        // is subtracted at most once (`EntryReturned` above) — but the money
+        // arithmetic stays checked rather than resting on that argument.
+        lot.total = lot
+            .total
+            .checked_sub(gross)
+            .ok_or(StateError::TotalOverflow)?;
+        Ok(view(s))
     })
 }
 
-/// `pick_winner` (recipient): name an accepted, non-returned lot as the winner
-/// → `Performing{winner_lot}`. This is how bidding ends — there is no scan.
-pub fn pick_winner(
-    auction_id: &[u8; 32],
-    signer: &[u8; 32],
-    lot_id: &[u8; 32],
-    now: u64,
-) -> Result<State, StateError> {
-    with_auction(auction_id, |s| {
-        require_recipient(s, signer)?;
-        // Only an accepted, non-returned lot may be picked.
-        match s.lots.iter().find(|l| l.lot_id == *lot_id) {
-            None => return Err(StateError::LotNotFound),
-            Some(l) if l.returned.is_some() => return Err(StateError::LotReturned),
-            Some(l) if l.accepted_at.is_none() => return Err(StateError::LotNotAccepted),
-            Some(_) => {}
-        }
-        step(&mut s.auction, Action::PickWinner { lot_id: *lot_id }, now)
-            .map_err(StateError::Step)?;
-        Ok(s.auction.state.clone())
-    })
-}
-
-/// `cancel_auction` (recipient): `Bidding → Done{None}`.
+/// `cancel_auction` (recipient): `Bidding → Done{winner_lot: None}`. Only before
+/// the close — once the window shuts the winner is fixed and `Done` is absorbing.
 pub fn cancel_auction(
     auction_id: &[u8; 32],
     signer: &[u8; 32],
     now: u64,
-) -> Result<State, StateError> {
+) -> Result<View, StateError> {
     with_auction(auction_id, |s| {
         require_recipient(s, signer)?;
-        step(&mut s.auction, Action::CancelAuction, now).map_err(StateError::Step)?;
-        Ok(s.auction.state.clone())
+        step_now(s, Action::CancelAuction, now)?;
+        Ok(view(s))
     })
-}
-
-/// `ready` (recipient): `Performing → Voting{now}`.
-pub fn ready(auction_id: &[u8; 32], signer: &[u8; 32], now: u64) -> Result<State, StateError> {
-    with_auction(auction_id, |s| {
-        require_recipient(s, signer)?;
-        step(&mut s.auction, Action::Ready, now).map_err(StateError::Step)?;
-        Ok(s.auction.state.clone())
-    })
-}
-
-/// Time-free boundary pre-check for a vote: the cheap committed-state reasons a
-/// vote is doomed — unknown auction, over cap, duplicate voter, or the stored
-/// state is not `Voting`. Run in `admit_vote` *before* the weight proof so a
-/// replayed/valid-proof-but-doomed vote dies at the boundary without a BLS
-/// pairing, instead of re-verifying on the replicated path (harness §6). It is a
-/// strict subset of `add_vote`'s rejections — a vote `add_vote` would accept is
-/// on a materialized, `Voting`, under-cap, non-duplicate auction, so all four
-/// checks pass here; `add_vote` stays the authoritative gate (it advances time
-/// and mutates). The stored state suffices: `Voting` is only ever left for
-/// `Done` by time, never entered, so an effective `Voting` implies a stored one.
-pub fn vote_admits(
-    auction_id: &[u8; 32],
-    voter: &[u8; 32],
-    v_max: usize,
-) -> Result<(), StateError> {
-    AUCTIONS.with_borrow(|a| {
-        let s = a.get(auction_id).ok_or(StateError::NotFound)?;
-        if s.auction.votes.len() >= v_max {
-            return Err(StateError::VoteCapReached);
-        }
-        if s.auction.votes.iter().any(|e| e.voter == *voter) {
-            return Err(StateError::Step(StepError::DuplicateVoter));
-        }
-        if !matches!(s.auction.state, State::Voting { .. }) {
-            return Err(StateError::Step(StepError::InvalidTransition));
-        }
-        Ok(())
-    })
-}
-
-/// Record a weight-proven vote on the (winner) lot: gated `Voting`, dedup +
-/// threshold in the machine, capped `V_MAX`.
-pub fn add_vote(
-    auction_id: &[u8; 32],
-    vote: Vote,
-    now: u64,
-    v_max: usize,
-) -> Result<State, StateError> {
-    with_auction(auction_id, |s| {
-        if s.auction.votes.len() >= v_max {
-            return Err(StateError::VoteCapReached);
-        }
-        step(&mut s.auction, Action::Vote(vote), now).map_err(StateError::Step)?;
-        Ok(s.auction.state.clone())
-    })
-}
-
-/// The recipient-picked winner lot, or `None` before `pick_winner`.
-pub fn winner_lot(auction_id: &[u8; 32]) -> Option<[u8; 32]> {
-    AUCTIONS.with_borrow(|a| a.get(auction_id)?.auction.winner_lot)
 }
 
 /// The stage-1 input: is `escrow` unknown to the auction, live, or returned.
@@ -393,49 +397,129 @@ pub fn lot_status(auction_id: &[u8; 32], lot_id: &[u8; 32]) -> Known {
 
 // ---- reads ----
 
-/// The auction's recipient (for weight-proof keying).
-pub fn recipient(auction_id: &[u8; 32]) -> Option<[u8; 32]> {
-    AUCTIONS.with_borrow(|a| a.get(auction_id).map(|s| s.recipient))
+/// The already-committed fact about an action's *target* that the boundary adds
+/// to the auction state (harness §6).
+///
+/// **Monotone is the entire requirement.** `accepted_at` and `returned` only ever
+/// go `None → Some`, so a refusal here is one the update will still make when it
+/// runs a round later. Facts that can *appear* between the boundary and execution
+/// — an unknown lot, an unknown entry — are deliberately absent: refusing on them
+/// would drop a call that a registration landing in the same round makes valid,
+/// and a legitimate call dropped for free reads as a refusal without cause.
+///
+/// Without this the boundary admitted every action from the right signer, and the
+/// doomed ones ran replicated at the canister's expense. That is not a one-off
+/// cost: the signed half of a request carries **no nonce and no expiry**, so one
+/// observed `accept_lot` is a template anyone can resubmit forever, each replay
+/// buying a full Ed25519 verification plus a replicated round.
+#[derive(Clone, Copy)]
+pub enum Target {
+    /// `accept_lot`: a lot already accepted, or already returned, is doomed.
+    LotToAccept([u8; 32]),
+    /// `return_lot`: a lot already returned is doomed.
+    LotToReturn([u8; 32]),
+    /// `return_entry`: an entry already returned is doomed. A *returned lot* is
+    /// not — `return_entry` does not check it, and the boundary must stay a
+    /// strict subset of the update.
+    EntryToReturn([u8; 32], [u8; 32]),
+    /// `cancel_auction`: it names no target, so the auction state is the whole
+    /// check.
+    Auction,
 }
 
-/// Time-free boundary pre-check for a recipient action (harness §6), the twin of
-/// [`vote_admits`]: unknown auction, wrong signer, or a stored state that admits
-/// no action of this kind.
+fn target_admits(s: &StoredAuction, target: Target) -> Result<(), StateError> {
+    let lot = |id: &[u8; 32]| s.lots.iter().find(|l| l.lot_id == *id);
+    match target {
+        Target::Auction => Ok(()),
+        Target::LotToAccept(lot_id) => match lot(&lot_id) {
+            Some(l) if l.returned.is_some() => Err(StateError::LotReturned),
+            Some(l) if l.accepted_at.is_some() => Err(StateError::LotAlreadyAccepted),
+            _ => Ok(()),
+        },
+        Target::LotToReturn(lot_id) => match lot(&lot_id) {
+            Some(l) if l.returned.is_some() => Err(StateError::LotReturned),
+            _ => Ok(()),
+        },
+        Target::EntryToReturn(lot_id, escrow) => match lot(&lot_id) {
+            Some(l) => match l.entries.iter().find(|e| e.escrow == escrow) {
+                Some(e) if e.returned.is_some() => Err(StateError::EntryReturned),
+                _ => Ok(()),
+            },
+            None => Ok(()),
+        },
+    }
+}
+
+/// Time-free boundary pre-check for a recipient action (harness §6): unknown
+/// auction, wrong signer, a stored state that admits no action at all, or a
+/// target already in the terminal shape this action would move it to.
 ///
-/// Takes an [`ActionKind`], not an `Action`: `return_lot`/`return_entry` carry a
-/// winner flag this canister reads from stored state, and the boundary must not
-/// guess it — a kind is admitted if *some* flag would be. Together with the
-/// time-free reading that makes the check conservative on both axes, which is
-/// what `State::admits` documents and an exhaustive machine test pins.
+/// It needs no action *kind*: with the winner arithmetic every recipient action
+/// lives in `Bidding` and none survives the close, so the state half is decided
+/// by the state alone; what still differs per action is the target, and that is
+/// [`Target`]. Conservative on time — answered against the stored, un-advanced
+/// state, and `Bidding` only ever leaves for `Done`, which admits nothing.
 ///
 /// A strict subset of the per-action state ops' rejections, which stay
-/// authoritative. Without it the boundary passed every action from the right
-/// signer, and the doomed ones were executed replicated at the canister's
-/// expense — free for the sender, and unbounded, since the signed half of a
-/// request carries no nonce and replays.
-pub fn action_admits(
+/// authoritative.
+pub fn recipient_admits(
     auction_id: &[u8; 32],
     signer: &[u8; 32],
-    kind: ActionKind,
+    target: Target,
 ) -> Result<(), StateError> {
     AUCTIONS.with_borrow(|a| {
         let s = a.get(auction_id).ok_or(StateError::NotFound)?;
         if s.recipient != *signer {
             return Err(StateError::NotRecipient);
         }
-        if !s.auction.state.admits(kind) {
+        if !s.auction.state.admits() {
             return Err(StateError::Step(StepError::InvalidTransition));
         }
-        Ok(())
+        target_admits(s, target)
     })
 }
 
-/// The auction's state, with accrued time transitions applied at `now`.
-pub fn auction_state(auction_id: &[u8; 32], now: u64) -> Option<State> {
+/// Time-free boundary pre-check for `register_entry` — the cheap, committed-state
+/// half, run **before** the threshold-resolver and PDA derivations and the
+/// birth-proof walk (`cost.md §6` #2: the cheapest decisive check first).
+///
+/// An auction this canister has never seen is **not** a refusal: a first confirmed
+/// entry is exactly what materializes one. A known auction must still be open, and
+/// the lot must not have been returned — both monotone, so a refusal here is one
+/// the update will still make.
+///
+/// This is the vector that actually mattered. A registration doomed for a reason
+/// the boundary did not read — the auction closed, the lot returned — was admitted
+/// and executed replicated, and since the escrow stays `Unknown` it never trips
+/// `DuplicateEscrow` either. One birth-proved request, valid forever, replayed at
+/// no cost to the sender, each replay buying a signature verification, a resolver
+/// derivation, a PDA bump search and a hash-tree walk on every node.
+pub fn register_admits(auction_id: &[u8; 32], lot_id: &[u8; 32]) -> Result<(), StateError> {
+    AUCTIONS.with_borrow(|a| {
+        let Some(s) = a.get(auction_id) else {
+            return Ok(()); // unmaterialized — this entry may be the one that creates it
+        };
+        if !s.auction.state.admits() {
+            return Err(StateError::Step(StepError::InvalidTransition));
+        }
+        match s.lots.iter().find(|l| l.lot_id == *lot_id) {
+            Some(l) if l.returned.is_some() => Err(StateError::LotReturned),
+            _ => Ok(()),
+        }
+    })
+}
+
+/// The auction's state, with the accrued close applied at `now`. Called from
+/// `request_signature` (an update, where the close persists) and from the
+/// read-only queries, where the mutation is discarded — harmless, because the
+/// close is a pure function of a lot set that `T` has already frozen, so both
+/// paths compute the same winner.
+pub fn auction_state(auction_id: &[u8; 32], now: u64) -> Option<View> {
     AUCTIONS.with_borrow_mut(|a| {
         let s = a.get_mut(auction_id)?;
-        let _ = step(&mut s.auction, Action::Tick, now);
-        Some(s.auction.state.clone())
+        let (auction, lots) = (&mut s.auction, &s.lots);
+        let _ = tick(auction, now, || top_lot(lots));
+        Some(view(s))
     })
 }
 
@@ -457,8 +541,15 @@ pub fn entry_scope(
     })
 }
 
-/// A lot's public view: `(accepted, returned, live_entries, text_hash)`.
-pub fn lot_view(auction_id: &[u8; 32], lot_id: &[u8; 32]) -> Option<(bool, bool, u64, [u8; 32])> {
+/// A lot's public view: `(accepted, returned, live_entries, total, text_hash)`.
+///
+/// `total` is on the view because the winner is now arithmetic: a donor deciding
+/// whether to top up has to be able to see the standing they are bidding against,
+/// and it is the canister's own number rather than the board's reconstruction.
+pub fn lot_view(
+    auction_id: &[u8; 32],
+    lot_id: &[u8; 32],
+) -> Option<(bool, bool, u64, u128, [u8; 32])> {
     AUCTIONS.with_borrow(|a| {
         let s = a.get(auction_id)?;
         let lot = s.lots.iter().find(|l| l.lot_id == *lot_id)?;
@@ -467,6 +558,7 @@ pub fn lot_view(auction_id: &[u8; 32], lot_id: &[u8; 32]) -> Option<(bool, bool,
             lot.accepted_at.is_some(),
             lot.returned.is_some(),
             live,
+            lot.total,
             lot.text_hash,
         ))
     })
@@ -479,18 +571,14 @@ mod tests {
 
     const CREATED: u64 = 1_000;
     const DUR: u64 = 600;
-    const PW: u64 = 300;
-    const VP: u64 = 120;
+    /// The close instant `T`.
+    const T: u64 = CREATED + DUR;
 
     fn fresh_auction() -> Auction {
         Auction {
             state: State::Bidding,
             created_at: CREATED,
             duration: DUR,
-            perform_window: PW,
-            voting_period: VP,
-            winner_lot: None,
-            votes: Vec::new(),
         }
     }
 
@@ -513,7 +601,7 @@ mod tests {
         lot: [u8; 32],
         text: [u8; 32],
         escrow: [u8; 32],
-        _gross: u64, // the canister is blind to amounts; kept to document the bid
+        gross: u64,
         now: u64,
     ) -> Result<(), StateError> {
         // A distinct leaf scope per escrow (in production `entry_id`); here the
@@ -526,7 +614,39 @@ mod tests {
         // are_distinct_scopes`. Do not "strengthen" this fixture by re-deriving
         // `entry_id`: it would re-test `protocol` and still tell us nothing about
         // `state`, which stores whatever scope it is handed.
-        add_entry(id, text, lot, escrow, escrow, now)
+        add_entry(id, text, lot, escrow, escrow, gross, now)
+    }
+
+    /// The winner after the close at `now`.
+    fn winner(id: &[u8; 32], now: u64) -> Option<[u8; 32]> {
+        match auction_state(id, now) {
+            Some(View {
+                state: State::Done { winner_lot },
+                ..
+            }) => winner_lot,
+            _ => None,
+        }
+    }
+
+    /// The view every still-open op returns: `Bidding`, closing at `T`. Spelled
+    /// once so the assertions below stay about the auction, not about the view.
+    fn open() -> View {
+        View {
+            state: State::Bidding,
+            closes_at: T,
+        }
+    }
+
+    /// The view of a closed auction with `winner_lot`.
+    fn closed(winner_lot: Option<[u8; 32]>) -> View {
+        View {
+            state: State::Done { winner_lot },
+            closes_at: T,
+        }
+    }
+
+    fn total(id: &[u8; 32], lot: &[u8; 32]) -> u128 {
+        lot_view(id, lot).unwrap().3
     }
 
     #[test]
@@ -542,36 +662,182 @@ mod tests {
     }
 
     #[test]
-    fn add_entry_creates_lots_and_dedups_escrow() {
+    fn add_entry_creates_lots_sums_them_and_dedups_escrow() {
         reset();
         let id = [1u8; 32];
         setup(id, [9; 32]);
-        // First entry of lot A → lot created.
+        // First entry of lot A → lot created, total = its gross.
         assert_eq!(
             entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1),
             Ok(())
         );
-        // Top-up into lot A (same text).
+        assert_eq!(total(&id, &[10; 32]), 500);
+        // Top-up into lot A (same text) adds to the same total.
         assert_eq!(
             entry(&id, [10; 32], [20; 32], [31; 32], 300, CREATED + 1),
             Ok(())
         );
-        // Different lot B.
+        assert_eq!(total(&id, &[10; 32]), 800);
+        // Different lot B keeps its own total.
         assert_eq!(
             entry(&id, [11; 32], [21; 32], [32; 32], 900, CREATED + 1),
             Ok(())
         );
-        // Duplicate escrow → rejected (no double count).
+        assert_eq!(total(&id, &[11; 32]), 900);
+        // Duplicate escrow → rejected, and it does not double-count the deposit.
         assert_eq!(
             entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1),
             Err(StateError::DuplicateEscrow)
         );
-        // After T → register frozen; the state stays Bidding (no auto-transition).
+        assert_eq!(total(&id, &[10; 32]), 800);
+        // At T the window shuts: registration is refused and the auction is closed.
         assert_eq!(
-            entry(&id, [11; 32], [21; 32], [33; 32], 100, CREATED + DUR),
+            entry(&id, [11; 32], [21; 32], [33; 32], 100, T),
             Err(StateError::Step(StepError::InvalidTransition))
         );
-        assert_eq!(auction_state(&id, CREATED + DUR), Some(State::Bidding));
+        // Neither lot was accepted, so nobody won.
+        assert_eq!(auction_state(&id, T), Some(closed(None)));
+    }
+
+    /// The rule the whole redesign exists for: at the close the heaviest accepted
+    /// lot wins, and topping up is how a lot gets there.
+    #[test]
+    fn the_heaviest_accepted_lot_wins_the_close() {
+        reset();
+        let id = [1u8; 32];
+        let r = [9u8; 32];
+        setup(id, r);
+        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap(); // A: 500
+        entry(&id, [11; 32], [21; 32], [32; 32], 900, CREATED + 1).unwrap(); // B: 900
+        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
+        accept_lot(&id, &r, &[11; 32], CREATED + 2).unwrap();
+        // B leads — until two top-ups carry A past it.
+        entry(&id, [10; 32], [20; 32], [33; 32], 300, CREATED + 3).unwrap(); // A: 800
+        entry(&id, [10; 32], [20; 32], [34; 32], 200, CREATED + 3).unwrap(); // A: 1000
+        assert_eq!(total(&id, &[10; 32]), 1_000);
+        assert_eq!(winner(&id, T), Some([10u8; 32]));
+    }
+
+    /// Only lots the recipient accepted compete — an unaccepted lot cannot win no
+    /// matter how heavy it is.
+    #[test]
+    fn an_unaccepted_lot_never_wins_however_heavy() {
+        reset();
+        let id = [1u8; 32];
+        let r = [9u8; 32];
+        setup(id, r);
+        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap(); // accepted
+        entry(&id, [11; 32], [21; 32], [32; 32], 9_000, CREATED + 1).unwrap(); // never accepted
+        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
+        assert_eq!(winner(&id, T), Some([10u8; 32]));
+    }
+
+    /// A returned lot is out of the contest, and the next heaviest takes the close.
+    #[test]
+    fn returning_the_leader_hands_the_close_to_the_runner_up() {
+        reset();
+        let id = [1u8; 32];
+        let r = [9u8; 32];
+        setup(id, r);
+        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
+        entry(&id, [11; 32], [21; 32], [32; 32], 900, CREATED + 1).unwrap();
+        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
+        accept_lot(&id, &r, &[11; 32], CREATED + 2).unwrap();
+        return_lot(&id, &r, &[11; 32], CREATED + 3).unwrap();
+        assert_eq!(winner(&id, T), Some([10u8; 32]));
+    }
+
+    /// A returned entry stops weighing, which can flip the close.
+    #[test]
+    fn a_returned_entry_leaves_its_lots_total() {
+        reset();
+        let id = [1u8; 32];
+        let r = [9u8; 32];
+        setup(id, r);
+        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap(); // A: 500
+        entry(&id, [10; 32], [20; 32], [31; 32], 600, CREATED + 1).unwrap(); // A: 1100
+        entry(&id, [11; 32], [21; 32], [32; 32], 900, CREATED + 1).unwrap(); // B: 900
+        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
+        accept_lot(&id, &r, &[11; 32], CREATED + 2).unwrap();
+        // A leads with 1100; returning its 600 drops it to 500, behind B.
+        return_entry(&id, &r, &[10; 32], &[31; 32], CREATED + 3).unwrap();
+        assert_eq!(total(&id, &[10; 32]), 500);
+        assert_eq!(winner(&id, T), Some([11u8; 32]));
+    }
+
+    /// An accepted lot whose every entry was returned holds no money — it must not
+    /// win a settle over an empty set of escrows.
+    #[test]
+    fn an_emptied_lot_cannot_win() {
+        reset();
+        let id = [1u8; 32];
+        let r = [9u8; 32];
+        setup(id, r);
+        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
+        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
+        return_entry(&id, &r, &[10; 32], &[30; 32], CREATED + 3).unwrap();
+        assert_eq!(total(&id, &[10; 32]), 0);
+        assert_eq!(winner(&id, T), None);
+    }
+
+    /// Ties go to the lot that opened first: a later bid must outbid, not match.
+    /// Two auctions, because reading the winner closes the one it is read on —
+    /// the tie and the one-unit-over case cannot share a timeline.
+    #[test]
+    fn a_tie_goes_to_the_lot_that_opened_first() {
+        reset();
+        let r = [9u8; 32];
+        // `b_extra` minor units go onto the later lot B; the winner is returned.
+        let close_with = |id: [u8; 32], b_extra: u64| {
+            setup(id, r);
+            entry(&id, [10; 32], [20; 32], [30; 32], 700, CREATED + 1).unwrap(); // A first
+            entry(&id, [11; 32], [21; 32], [32; 32], 700, CREATED + 2).unwrap(); // B equal
+            if b_extra > 0 {
+                entry(&id, [11; 32], [21; 32], [33; 32], b_extra, CREATED + 2).unwrap();
+            }
+            accept_lot(&id, &r, &[10; 32], CREATED + 3).unwrap();
+            accept_lot(&id, &r, &[11; 32], CREATED + 3).unwrap();
+            winner(&id, T)
+        };
+        // Dead heat → the lot that opened first takes it.
+        assert_eq!(close_with([1u8; 32], 0), Some([10u8; 32]));
+        // One more minor unit on B and it takes the close outright.
+        assert_eq!(close_with([2u8; 32], 1), Some([11u8; 32]));
+    }
+
+    /// The close is computed once. A first touch long after `T` must produce the
+    /// same winner as one at `T` — and, once stored, must never be recomputed.
+    #[test]
+    fn the_close_is_fixed_and_independent_of_when_it_is_first_touched() {
+        reset();
+        let id = [1u8; 32];
+        let r = [9u8; 32];
+        setup(id, r);
+        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
+        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
+        // First touch a long way past T.
+        assert_eq!(winner(&id, T + 100_000), Some([10u8; 32]));
+        // And it stays put on every later read.
+        assert_eq!(winner(&id, T + 200_000), Some([10u8; 32]));
+    }
+
+    /// Nothing the recipient does survives the close — the winner cannot be
+    /// curated away after the fact.
+    #[test]
+    fn recipient_actions_are_refused_after_the_close() {
+        reset();
+        let id = [1u8; 32];
+        let r = [9u8; 32];
+        setup(id, r);
+        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
+        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
+        let doomed = Err(StateError::Step(StepError::InvalidTransition));
+        assert_eq!(cancel_auction(&id, &r, T), doomed);
+        assert_eq!(return_lot(&id, &r, &[10; 32], T), doomed);
+        assert_eq!(return_entry(&id, &r, &[10; 32], &[30; 32], T), doomed);
+        assert_eq!(accept_lot(&id, &r, &[10; 32], T), doomed);
+        // The winner picked at the close is untouched.
+        assert_eq!(winner(&id, T), Some([10u8; 32]));
     }
 
     #[test]
@@ -588,7 +854,7 @@ mod tests {
         // Recipient accepts.
         assert_eq!(
             accept_lot(&id, &[9; 32], &[10; 32], CREATED + 1),
-            Ok(State::Bidding)
+            Ok(open())
         );
         // Second accept → already accepted.
         assert_eq!(
@@ -608,12 +874,10 @@ mod tests {
         let id = [1u8; 32];
         setup(id, [9; 32]);
         entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
-        // Recipient returns the (non-winner) lot in Bidding.
         assert_eq!(
             return_lot(&id, &[9; 32], &[10; 32], CREATED + 2),
-            Ok(State::Bidding)
+            Ok(open())
         );
-        // A top-up into the returned lot is refused (reviewer caveat).
         assert_eq!(
             entry(&id, [10; 32], [20; 32], [31; 32], 300, CREATED + 3),
             Err(StateError::LotReturned)
@@ -629,13 +893,17 @@ mod tests {
         entry(&id, [10; 32], [20; 32], [31; 32], 300, CREATED + 1).unwrap();
         assert_eq!(
             return_entry(&id, &[9; 32], &[10; 32], &[30; 32], CREATED + 2),
-            Ok(State::Bidding)
+            Ok(open())
         );
-        // Second return of the same escrow → already returned.
+        assert_eq!(entry_status(&id, &[10; 32], &[30; 32]), Known::Returned);
+        assert_eq!(entry_status(&id, &[10; 32], &[31; 32]), Known::Live);
+        // A second return of the same escrow → already returned, and the total
+        // does not drop twice.
         assert_eq!(
             return_entry(&id, &[9; 32], &[10; 32], &[30; 32], CREATED + 2),
             Err(StateError::EntryReturned)
         );
+        assert_eq!(total(&id, &[10; 32]), 300);
         // Unknown escrow.
         assert_eq!(
             return_entry(&id, &[9; 32], &[10; 32], &[77; 32], CREATED + 2),
@@ -644,14 +912,16 @@ mod tests {
     }
 
     #[test]
-    fn cancel_from_bidding_is_done_none() {
+    fn cancel_from_bidding_is_done_with_no_winner() {
         reset();
         let id = [1u8; 32];
-        setup(id, [9; 32]);
-        assert_eq!(
-            cancel_auction(&id, &[9; 32], CREATED + 1),
-            Ok(State::Done { winner: None })
-        );
+        let r = [9u8; 32];
+        setup(id, r);
+        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
+        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
+        assert_eq!(cancel_auction(&id, &r, CREATED + 3), Ok(closed(None)));
+        // A cancelled auction has no winner even though a heavy lot stood.
+        assert_eq!(winner(&id, T), None);
     }
 
     #[test]
@@ -670,320 +940,179 @@ mod tests {
     }
 
     #[test]
-    fn pick_winner_opens_performing_and_gates() {
-        reset();
-        let id = [1u8; 32];
-        setup(id, [9; 32]);
-        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap(); // lot A
-        entry(&id, [11; 32], [21; 32], [32; 32], 900, CREATED + 1).unwrap(); // lot B
-        accept_lot(&id, &[9; 32], &[10; 32], CREATED + 2).unwrap(); // accept A only
-
-        // Stranger cannot pick.
-        assert_eq!(
-            pick_winner(&id, &[8; 32], &[10; 32], CREATED + 3),
-            Err(StateError::NotRecipient)
-        );
-        // Unaccepted lot B cannot be picked.
-        assert_eq!(
-            pick_winner(&id, &[9; 32], &[11; 32], CREATED + 3),
-            Err(StateError::LotNotAccepted)
-        );
-        // Unknown lot.
-        assert_eq!(
-            pick_winner(&id, &[9; 32], &[99; 32], CREATED + 3),
-            Err(StateError::LotNotFound)
-        );
-        // Picking the accepted lot A → Performing, winner fixed.
-        assert_eq!(
-            pick_winner(&id, &[9; 32], &[10; 32], CREATED + 3),
-            Ok(State::Performing)
-        );
-        assert_eq!(winner_lot(&id), Some([10u8; 32]));
-        // A second pick (now Performing) → invalid.
-        assert_eq!(
-            pick_winner(&id, &[9; 32], &[10; 32], CREATED + 4),
-            Err(StateError::Step(StepError::InvalidTransition))
-        );
-    }
-
-    #[test]
-    fn a_returned_lot_cannot_be_picked() {
-        reset();
-        let id = [1u8; 32];
-        setup(id, [9; 32]);
-        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
-        accept_lot(&id, &[9; 32], &[10; 32], CREATED + 2).unwrap();
-        return_lot(&id, &[9; 32], &[10; 32], CREATED + 3).unwrap();
-        assert_eq!(
-            pick_winner(&id, &[9; 32], &[10; 32], CREATED + 4),
-            Err(StateError::LotReturned)
-        );
-    }
-
-    #[test]
-    fn pick_after_bidding_close_still_works() {
-        reset();
-        let id = [1u8; 32];
-        setup(id, [9; 32]);
-        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
-        accept_lot(&id, &[9; 32], &[10; 32], CREATED + 2).unwrap();
-        // Registration is frozen after T, but picking is still open (state Bidding).
-        assert_eq!(auction_state(&id, CREATED + DUR + 5), Some(State::Bidding));
-        assert_eq!(
-            pick_winner(&id, &[9; 32], &[10; 32], CREATED + DUR + 5),
-            Ok(State::Performing)
-        );
-    }
-
-    fn mkvote(v: u8) -> Vote {
-        Vote {
-            voter: [v; 32],
-            weight: 200_000, // ≥ MIN_VOTE_WEIGHT (100_000)
-            done: true,
-        }
-    }
-
-    /// Materialize → one accepted lot → picked → ready, leaving the auction in
-    /// `Voting{started_at: CREATED+4}` with recipient `[9;32]`.
-    fn to_voting(id: [u8; 32]) {
-        setup(id, [9; 32]);
-        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
-        accept_lot(&id, &[9; 32], &[10; 32], CREATED + 2).unwrap();
-        pick_winner(&id, &[9; 32], &[10; 32], CREATED + 3).unwrap();
-        ready(&id, &[9; 32], CREATED + 4).unwrap();
-    }
-
-    #[test]
     fn unmaterialized_self_signed_actions_are_not_found() {
-        // A self-signed ready/cancel/pick/accept/return/vote does NOT materialize an
-        // auction (only a birth-proven `register` does): every one is NotFound on an
-        // unknown id and writes nothing.
+        // A self-signed cancel/accept/return does NOT materialize an auction (only
+        // a birth-proven `register` does): every one is NotFound on an unknown id
+        // and writes nothing.
         reset();
         let id = [1u8; 32];
         let r = [9u8; 32];
-        assert_eq!(ready(&id, &r, 1), Err(StateError::NotFound));
         assert_eq!(cancel_auction(&id, &r, 1), Err(StateError::NotFound));
-        assert_eq!(
-            pick_winner(&id, &r, &[10; 32], 1),
-            Err(StateError::NotFound)
-        );
         assert_eq!(accept_lot(&id, &r, &[10; 32], 1), Err(StateError::NotFound));
         assert_eq!(return_lot(&id, &r, &[10; 32], 1), Err(StateError::NotFound));
         assert_eq!(
             return_entry(&id, &r, &[10; 32], &[30; 32], 1),
             Err(StateError::NotFound)
         );
-        assert_eq!(add_vote(&id, mkvote(1), 1, 500), Err(StateError::NotFound));
         assert!(!is_materialized(&id));
     }
 
-    #[test]
-    fn winner_lot_return_and_entry_return_in_performing() {
-        reset();
-        let id = [1u8; 32];
-        let r = [9u8; 32];
-        setup(id, r);
-        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap(); // lot A → winner
-        entry(&id, [11; 32], [21; 32], [32; 32], 900, CREATED + 1).unwrap(); // lot B → loser
-        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
-        assert_eq!(
-            pick_winner(&id, &r, &[10; 32], CREATED + 3),
-            Ok(State::Performing)
-        );
-        // return_entry on the winner lot is allowed in Performing (marks one escrow).
-        assert_eq!(
-            return_entry(&id, &r, &[10; 32], &[30; 32], CREATED + 4),
-            Ok(State::Performing)
-        );
-        assert_eq!(entry_status(&id, &[10; 32], &[30; 32]), Known::Returned);
-        // return_entry on a NON-winner lot in Performing is rejected (loser lot is
-        // already auto-cancelled — only the winner lot may be touched).
-        assert_eq!(
-            return_entry(&id, &r, &[11; 32], &[32; 32], CREATED + 4),
-            Err(StateError::Step(StepError::InvalidTransition))
-        );
-        // The recipient may return the winner lot in Performing → Done{Cancel}.
-        assert_eq!(
-            return_lot(&id, &r, &[10; 32], CREATED + 5),
-            Ok(State::Done {
-                winner: Some(auction_logic::Outcome::Cancel)
-            })
-        );
-    }
-
-    #[test]
-    fn ready_gates_bidding_and_add_vote_requires_voting() {
-        reset();
-        let id = [1u8; 32];
-        let r = [9u8; 32];
-        setup(id, r);
-        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
-        accept_lot(&id, &r, &[10; 32], CREATED + 2).unwrap();
-        // `ready` is invalid while still Bidding (not yet picked).
-        assert_eq!(
-            ready(&id, &r, CREATED + 2),
-            Err(StateError::Step(StepError::InvalidTransition))
-        );
-        // Pick → Performing; a vote before `ready` (not yet Voting) is invalid.
-        pick_winner(&id, &r, &[10; 32], CREATED + 3).unwrap();
-        assert_eq!(
-            add_vote(&id, mkvote(1), CREATED + 3, 500),
-            Err(StateError::Step(StepError::InvalidTransition))
-        );
-        // `ready` → Voting.
-        assert_eq!(
-            ready(&id, &r, CREATED + 4),
-            Ok(State::Voting {
-                started_at: CREATED + 4
-            })
-        );
-    }
-
-    #[test]
-    fn add_vote_caps_at_v_max_and_wires_the_threshold() {
-        reset();
-        let id = [1u8; 32];
-        to_voting(id);
-        let voting = State::Voting {
-            started_at: CREATED + 4,
-        };
-        // Cap of 2: two distinct votes land; the third is refused before the machine.
-        assert_eq!(add_vote(&id, mkvote(1), CREATED + 5, 2), Ok(voting.clone()));
-        assert_eq!(add_vote(&id, mkvote(2), CREATED + 5, 2), Ok(voting));
-        assert_eq!(
-            add_vote(&id, mkvote(3), CREATED + 5, 2),
-            Err(StateError::VoteCapReached)
-        );
-        // Below-threshold weight is refused (wiring to the machine's threshold),
-        // even under a high cap.
-        let weak = Vote {
-            voter: [4; 32],
-            weight: 1,
-            done: true,
-        };
-        assert_eq!(
-            add_vote(&id, weak, CREATED + 5, 500),
-            Err(StateError::Step(StepError::WeightBelowThreshold))
-        );
-    }
-
     /// The boundary must refuse a doomed recipient action, not leave it to the
-    /// update — otherwise one signed `ready` (or `cancel`, or `pick`) is a flood
-    /// template executed replicated at the canister's expense.
+    /// update — otherwise one signed `cancel` is a flood template executed
+    /// replicated at the canister's expense.
     #[test]
-    fn action_admits_refuses_what_the_state_will_refuse() {
+    fn recipient_admits_refuses_what_the_state_will_refuse() {
         reset();
         let id = [1u8; 32];
         let recipient = [9u8; 32];
 
         assert_eq!(
-            action_admits(&id, &recipient, ActionKind::Ready),
+            recipient_admits(&id, &recipient, Target::Auction),
             Err(StateError::NotFound)
         );
 
         materialize(id, fresh_auction(), recipient, 1).unwrap();
         assert_eq!(
-            action_admits(&id, &[8u8; 32], ActionKind::CancelAuction),
+            recipient_admits(&id, &[8u8; 32], Target::Auction),
             Err(StateError::NotRecipient)
         );
-
-        // `Bidding` runs the auction but has no `ready` and no vote.
-        for k in [
-            ActionKind::AcceptLot,
-            ActionKind::ReturnLot,
-            ActionKind::ReturnEntry,
-            ActionKind::PickWinner,
-            ActionKind::CancelAuction,
-        ] {
-            assert_eq!(
-                action_admits(&id, &recipient, k),
-                Ok(()),
-                "{k:?} in Bidding"
-            );
-        }
-        for k in [ActionKind::Ready, ActionKind::Vote] {
-            assert_eq!(
-                action_admits(&id, &recipient, k),
-                Err(StateError::Step(StepError::InvalidTransition)),
-                "{k:?} must be refused while Bidding"
-            );
-        }
+        // `Bidding` runs the auction.
+        assert_eq!(recipient_admits(&id, &recipient, Target::Auction), Ok(()));
 
         // `Done` is absorbing: nothing at all, ever.
         cancel_auction(&id, &recipient, CREATED).unwrap();
-        for k in [
-            ActionKind::AcceptLot,
-            ActionKind::ReturnLot,
-            ActionKind::ReturnEntry,
-            ActionKind::PickWinner,
-            ActionKind::CancelAuction,
-            ActionKind::Ready,
-            ActionKind::Vote,
-        ] {
+        assert_eq!(
+            recipient_admits(&id, &recipient, Target::Auction),
+            Err(StateError::Step(StepError::InvalidTransition))
+        );
+    }
+
+    /// A signed request carries no nonce and no expiry, so one observed
+    /// `accept_lot`/`return_lot`/`return_entry` is a template anyone can resubmit
+    /// forever. Once its target is already in the shape the action would produce,
+    /// every replay is doomed — and must die at the boundary, not buy a replicated
+    /// round each time.
+    #[test]
+    fn the_boundary_kills_replays_of_an_action_already_applied() {
+        reset();
+        let id = [1u8; 32];
+        let r = [9u8; 32];
+        let (a, b) = ([10u8; 32], [11u8; 32]);
+        setup(id, r);
+        entry(&id, a, [20; 32], [30; 32], 500, CREATED + 1).unwrap();
+        entry(&id, b, [21; 32], [32; 32], 500, CREATED + 1).unwrap();
+
+        // Fresh targets are admitted.
+        assert_eq!(recipient_admits(&id, &r, Target::LotToAccept(a)), Ok(()));
+        assert_eq!(recipient_admits(&id, &r, Target::LotToReturn(b)), Ok(()));
+        assert_eq!(
+            recipient_admits(&id, &r, Target::EntryToReturn(a, [30; 32])),
+            Ok(())
+        );
+
+        accept_lot(&id, &r, &a, CREATED + 2).unwrap();
+        return_lot(&id, &r, &b, CREATED + 2).unwrap();
+        return_entry(&id, &r, &a, &[30; 32], CREATED + 2).unwrap();
+
+        // Every replay of the same signed action is now refused before execution,
+        // with the very error the update would have produced.
+        assert_eq!(
+            recipient_admits(&id, &r, Target::LotToAccept(a)),
+            Err(StateError::LotAlreadyAccepted)
+        );
+        assert_eq!(
+            recipient_admits(&id, &r, Target::LotToReturn(b)),
+            Err(StateError::LotReturned)
+        );
+        assert_eq!(
+            recipient_admits(&id, &r, Target::EntryToReturn(a, [30; 32])),
+            Err(StateError::EntryReturned)
+        );
+        // A returned lot can never be accepted either.
+        assert_eq!(
+            recipient_admits(&id, &r, Target::LotToAccept(b)),
+            Err(StateError::LotReturned)
+        );
+    }
+
+    /// The same for registration, and this is the vector that actually mattered: a
+    /// doomed `register_entry` keeps its escrow `Unknown`, so `DuplicateEscrow`
+    /// never catches the replay. Each admitted replay buys a resolver derivation,
+    /// a PDA bump search and a witness walk on every node — for free.
+    #[test]
+    fn the_boundary_kills_replays_of_a_doomed_registration() {
+        reset();
+        let id = [1u8; 32];
+        let r = [9u8; 32];
+        let (a, b) = ([10u8; 32], [11u8; 32]);
+
+        // An auction nobody has materialized yet is not a refusal — a first entry
+        // is exactly what creates one.
+        assert!(!is_materialized(&id));
+        assert_eq!(register_admits(&id, &a), Ok(()));
+
+        setup(id, r);
+        entry(&id, a, [20; 32], [30; 32], 500, CREATED + 1).unwrap();
+        entry(&id, b, [21; 32], [32; 32], 500, CREATED + 1).unwrap();
+        assert_eq!(register_admits(&id, &a), Ok(()));
+
+        // Returned lot → every further registration into it is doomed, forever.
+        return_lot(&id, &r, &b, CREATED + 2).unwrap();
+        assert_eq!(register_admits(&id, &b), Err(StateError::LotReturned));
+        assert_eq!(register_admits(&id, &a), Ok(()), "lot A is untouched");
+
+        // Closed auction → every registration is doomed, for every lot.
+        accept_lot(&id, &r, &a, CREATED + 3).unwrap();
+        assert_eq!(auction_state(&id, T), Some(closed(Some(a))));
+        for lot in [a, b] {
             assert_eq!(
-                action_admits(&id, &recipient, k),
-                Err(StateError::Step(StepError::InvalidTransition)),
-                "{k:?} must be refused on a done auction"
+                register_admits(&id, &lot),
+                Err(StateError::Step(StepError::InvalidTransition))
             );
         }
     }
 
     /// Every boundary rejection must be one the update would also make, or a
     /// legitimate call is dropped for free and reads as a refusal without cause.
-    /// `ready` is the interesting one: doomed in `Bidding`, live in `Performing`.
+    /// The targets the boundary deliberately does **not** read are the ones that
+    /// can appear later — an unknown lot, an unknown entry — because a
+    /// registration landing in the same round makes such a call valid.
     #[test]
-    fn action_admits_never_refuses_what_the_update_would_accept() {
+    fn the_boundary_never_refuses_what_the_update_would_accept() {
         reset();
         let id = [1u8; 32];
-        let recipient = [9u8; 32];
-        let lot = [3u8; 32];
-        materialize(id, fresh_auction(), recipient, 1).unwrap();
+        let r = [9u8; 32];
+        materialize(id, fresh_auction(), r, 1).unwrap();
 
+        // Unknown lot / unknown entry: admitted, precisely because they are not
+        // monotone. The update stays authoritative and answers LotNotFound.
         assert_eq!(
-            action_admits(&id, &recipient, ActionKind::PickWinner),
+            recipient_admits(&id, &r, Target::LotToAccept([77; 32])),
             Ok(())
         );
-        // A lot must exist and be accepted before it can win; drive the auction
-        // through the real ops so the states are the ones the update produces.
-        accept_lot(&id, &recipient, &lot, CREATED).ok();
-        if pick_winner(&id, &recipient, &lot, CREATED).is_ok() {
-            // Now `Performing`: `ready` becomes admissible and applicable.
-            assert_eq!(action_admits(&id, &recipient, ActionKind::Ready), Ok(()));
-            assert!(
-                ready(&id, &recipient, CREATED).is_ok(),
-                "update refused `ready` the boundary admitted"
-            );
-        }
-    }
+        assert_eq!(
+            recipient_admits(&id, &r, Target::EntryToReturn([77; 32], [78; 32])),
+            Ok(())
+        );
+        assert_eq!(register_admits(&id, &[77; 32]), Ok(()));
 
-    #[test]
-    fn vote_admits_is_a_subset_of_add_vote_and_needs_no_weight_proof() {
-        reset();
-        let id = [1u8; 32];
-        // Unknown auction → NotFound (the boundary drops it before any BLS).
-        assert_eq!(vote_admits(&id, &[1; 32], 500), Err(StateError::NotFound));
-        // Materialized but still Bidding (not Voting) → InvalidTransition.
-        setup(id, [9; 32]);
-        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED + 1).unwrap();
+        // And the update indeed accepts a real action the boundary admitted.
+        entry(&id, [10; 32], [20; 32], [30; 32], 500, CREATED).unwrap();
         assert_eq!(
-            vote_admits(&id, &[1; 32], 500),
-            Err(StateError::Step(StepError::InvalidTransition))
+            recipient_admits(&id, &r, Target::LotToAccept([10; 32])),
+            Ok(())
         );
-        // Drive to Voting: a fresh voter with room is admitted.
-        accept_lot(&id, &[9; 32], &[10; 32], CREATED + 2).unwrap();
-        pick_winner(&id, &[9; 32], &[10; 32], CREATED + 3).unwrap();
-        ready(&id, &[9; 32], CREATED + 4).unwrap();
-        assert_eq!(vote_admits(&id, &[1; 32], 500), Ok(()));
-        // Record it → a replay of the same voter is DuplicateVoter (no BLS re-run).
-        add_vote(&id, mkvote(1), CREATED + 5, 500).unwrap();
+        assert!(
+            accept_lot(&id, &r, &[10; 32], CREATED).is_ok(),
+            "update refused an action the boundary admitted"
+        );
+        // `return_entry` does not read the lot's `returned` flag, so the boundary
+        // must not either — a strict subset, not a stricter one.
+        return_lot(&id, &r, &[10; 32], CREATED).unwrap();
         assert_eq!(
-            vote_admits(&id, &[1; 32], 500),
-            Err(StateError::Step(StepError::DuplicateVoter))
+            recipient_admits(&id, &r, Target::EntryToReturn([10; 32], [30; 32])),
+            Ok(())
         );
-        // Cap is checked before the duplicate scan (matching add_vote's order).
-        assert_eq!(
-            vote_admits(&id, &[2; 32], 1),
-            Err(StateError::VoteCapReached)
-        );
+        assert!(return_entry(&id, &r, &[10; 32], &[30; 32], CREATED).is_ok());
     }
 }

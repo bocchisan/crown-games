@@ -1,8 +1,7 @@
 //! Bakes the active config profile (`../config/<profile>.toml`) into the wasm.
-//! Nothing network lives in code: the index principal, threshold key name, the
-//! auction timings (voting period, perform window), `min_entry`, the paid-pull
-//! price, fee, chain id, factory, verdict domain, and the slot→time anchor all
-//! come from `config/`. Solana addresses (`fee_wallet`, `factory`) are base58 →
+//! Nothing network lives in code: the index principal, threshold key name,
+//! `min_entry`, the paid-pull price, fee, chain id, factory, verdict domain, and
+//! the slot→time anchor all come from `config/`. Solana addresses (`fee_wallet`, `factory`) are base58 →
 //! `[u8; 32]`; a placeholder decodes to zero (a hard error on the frozen
 //! `mainnet` profile, along with a zero slot→time anchor).
 
@@ -22,8 +21,6 @@ fn main() {
 
     let index = str_of(&text, "crown_index");
     let threshold_key = str_of(&text, "threshold_key");
-    let voting_period = u128_of(&text, "voting_period") as u64;
-    let perform_window = u128_of(&text, "perform_window") as u64;
     let min_entry = u128_of(&text, "min_entry") as u64;
     let sign_price = u128_of(&text, "sign_price");
     let root_price = u128_of(&text, "root_price");
@@ -53,10 +50,6 @@ fn main() {
          pub const CROWN_INDEX: &str = {index:?};\n\
          /// Threshold Ed25519 key name for the per-entry resolver.\n\
          pub const THRESHOLD_KEY: &str = {threshold_key:?};\n\
-         /// Voting-window length (seconds), baked into every `auction_id`.\n\
-         pub const VOTING_PERIOD: u64 = {voting_period};\n\
-         /// Perform-window length (seconds), baked into every `auction_id`.\n\
-         pub const PERFORM_WINDOW: u64 = {perform_window};\n\
          /// Minimum per-entry gross (minor units); 0 = only the form floor.\n\
          pub const MIN_ENTRY: u64 = {min_entry};\n\
          /// Price charged for a verdict signature (<= relay SIGN_PRICE).\n\

@@ -1,26 +1,30 @@
 //! auction A5 — live devnet e2e.
 //!
-//! The loop the auction could not close before: **two real escrows** on Solana
-//! devnet competing in one auction, proven to a **local** index, judged by a vote
-//! whose weight is **real book reputation**, decided by the game, signed by a
-//! **real** threshold key, and claimed back on devnet — settle for the winner,
-//! cancel for the loser. Money moves on both ends; nothing about the verdict, the
-//! vote weight or the escrow set is simulated.
+//! The loop the auction closes: **two real escrows** on Solana devnet competing in
+//! one auction, proven to a **local** index, decided by the **money on the table**
+//! — the heavier bid wins when the window shuts — signed by a **real** threshold
+//! key, and claimed back on devnet: settle for the winner, cancel for the loser.
+//! Money moves on both ends; nothing about the verdict or the escrow set is
+//! simulated.
+//!
+//! The winner is arithmetic, so this run proves it the only way that means
+//! anything: the two lots differ **only** in how much real test-USDC stands behind
+//! them, and nobody votes, picks or declares anything in between.
 //!
 //!   1. PocketIC: index + mock SOL RPC + relay proxy + auction (`key_1`);
-//!   2. **devnet**: a real `splitter.donate` buys the voter its reputation — the
-//!      only way the system allows (`00 §9`), folded from chain by the index;
-//!   3. derive `auction_id` → two lots → per-entry resolvers → escrow addresses;
-//!   4. **devnet**: two `create_escrow` fund two vaults with real test-USDC;
-//!   5. both real transactions are fetched and folded by the index into births;
-//!   6. `push_root` → two `register_entry` (direct ingress) → materialize + top-up;
-//!   7. `accept_lot` both → `pick_winner` → `ready` → **vote** with the book weight;
-//!   8. the voting window closes → paid `request_signature` per entry: the winner
-//!      resolves to settle, the loser to cancel — two real Ed25519 threshold
-//!      signatures under two **different** leaf resolvers;
-//!   9. **devnet**: `claim(settle)` pays the recipient net + the fee wallet, and
+//!   2. derive `auction_id` → two lots → per-entry resolvers → escrow addresses;
+//!   3. **devnet**: two `create_escrow` fund two vaults with real test-USDC —
+//!      the heavier one is the bid that must win;
+//!   4. both real transactions are fetched and folded by the index into births;
+//!   5. `push_root` → two `register_entry` (direct ingress) → materialize + the
+//!      second lot;
+//!   6. `accept_lot` both — the recipient's only lever, and it lets both compete;
+//!   7. the bidding window shuts on its own → paid `request_signature` per entry:
+//!      the heavier lot resolves to settle, the lighter to cancel — two real
+//!      Ed25519 threshold signatures under two **different** leaf resolvers;
+//!   8. **devnet**: `claim(settle)` pays the recipient net + the fee wallet, and
 //!      `claim(cancel)` returns the loser's gross to its donor; both vaults close;
-//!  10. the settlement is folded back: reputation lands on the **donor**, not on
+//!   9. the settlement is folded back: reputation lands on the **donor**, not on
 //!      the escrow address — the whole loop, closed.
 //!
 //! Why PocketIC directly rather than a local dfx replica: none — dfx 0.32's local
@@ -44,7 +48,7 @@
 //!     cargo run --manifest-path crown-games/auction/e2e/a5/Cargo.toml
 
 use anchor_lang::{InstructionData, ToAccountMetas};
-use auction::{protocol, AuctionResult, AuctionStateView, InitArgs};
+use auction::{protocol, AuctionResult, AuctionStateView, InitArgs, LotView};
 use candid::{CandidType, Decode, Deserialize, Encode, Nat, Principal, Reserved};
 use ed25519_dalek::{Signer as DalekSigner, SigningKey};
 use pocket_ic::{PocketIc, PocketIcBuilder, Time};
@@ -68,13 +72,14 @@ use std::{error::Error, time::SystemTime};
 type R<T> = Result<T, Box<dyn Error>>;
 
 const URL: &str = "https://api.devnet.solana.com";
-/// 2 USDC per entry — above the index dust floor and any game floor.
-const GROSS: u64 = 250_000;
-/// The reputation the voter buys itself: 0.5 USDC, comfortably over both
-/// `MIN_VOTE_WEIGHT` (0.10) and the index's `MIN_GROSS` (0.20).
-const SEED_GROSS: u64 = 250_000;
+/// The two bids, in USDC minor units. Both clear the index dust floor and the
+/// game floor (`min_entry` = 0.25); the winner is heavier, and that difference is
+/// the *only* thing that decides this run — there is nothing else left to decide
+/// it with.
+const WINNING_GROSS: u64 = 300_000; // 0.30 USDC
+const LOSING_GROSS: u64 = 250_000; // 0.25 USDC
 /// One hour of bidding — the run takes minutes, and a short window keeps the
-/// escrow deadline rule (`+ perform + voting + 72h margin`) modest.
+/// escrow deadline rule (`duration + 72h margin`) modest.
 const DURATION: u64 = 3_600;
 const SETTLE: u8 = 0;
 const CANCEL: u8 = 1;
@@ -102,8 +107,6 @@ fn at(rel: &str) -> String {
 /// address, so a stale copy here derives an id the canister refuses with
 /// `AuctionIdMismatch` — a rejection with nothing in it to read.
 struct Config {
-    voting_period: u64,
-    perform_window: u64,
     min_entry: u64,
     sign_price: u128,
     root_price: u128,
@@ -121,8 +124,6 @@ impl Config {
     fn load() -> R<Self> {
         let text = std::fs::read_to_string(at("../../config/testnet.toml"))?;
         Ok(Self {
-            voting_period: cfg_u128(&text, "voting_period")? as u64,
-            perform_window: cfg_u128(&text, "perform_window")? as u64,
             min_entry: cfg_u128(&text, "min_entry")? as u64,
             sign_price: cfg_u128(&text, "sign_price")?,
             root_price: cfg_u128(&text, "root_price")?,
@@ -524,6 +525,9 @@ struct Entry {
     lot_hex: String,
     text_hash: [u8; 32],
     nonce: u64,
+    /// What this bid puts on the table — and, at the close, the whole reason one
+    /// of these two entries settles and the other cancels.
+    gross: u64,
     resolver: [u8; 32],
     escrow: Pubkey,
     vault: Pubkey,
@@ -693,57 +697,12 @@ fn main() -> R<()> {
     }
     println!("    ✓ threshold key bootstrapped (key_1)");
 
-    // ---- 3) the voter buys its weight: a real direct donation ----
-    // A vote weighs book reputation, and the only way into the book is an honest
-    // settlement read from chain (`00 §9`, harness §1). So the voter donates for
-    // real through the delimiter, and the index folds that transaction.
-    println!("\n[3] devnet: splitter.donate → the voter's book weight");
     let chain = chain_key(&cfg.chain_id);
-    let donate_ix = Instruction {
-        program_id: two_outcome::SPLITTER,
-        accounts: splitter::accounts::Donate {
-            donor: donor_kp.pubkey(),
-            donor_ata,
-            recipient_ata,
-            mint: two_outcome::USDC_MINT,
-            token_program: spl_token::ID,
-            event_authority: Pubkey::find_program_address(
-                &[b"__event_authority"],
-                &two_outcome::SPLITTER,
-            )
-            .0,
-            program: two_outcome::SPLITTER,
-        }
-        .to_account_metas(None),
-        data: splitter::instruction::Donate { gross: SEED_GROSS }.data(),
-    };
-    let seed_sig = send(
-        &client,
-        &donor_kp,
-        &[
-            create_ata_idempotent(&donor_kp.pubkey(), &recipient_kp.pubkey()),
-            donate_ix,
-        ],
-    )?;
-    println!("    donate tx {seed_sig}");
-    match ingest(&pic, &client, mock, proxy, index, &seed_sig)? {
-        IngestResult::Applied {
-            settlements: 1,
-            anomalies: 0,
-            ..
-        } => {}
-        other => return Err(format!("the seed donation did not fold: {other:?}").into()),
-    }
-    let (weight, _) = reputation(&pic, index, &chain, &donor_pk, &recipient)?;
-    if weight != SEED_GROSS as u128 {
-        return Err(format!("book weight is {weight}, expected {SEED_GROSS}").into());
-    }
-    println!("    ✓ book credits the donor {weight} against this recipient");
 
-    // ---- 4) derive the auction, its two lots and their escrow addresses ----
+    // ---- 3) derive the auction, its two lots and their escrow addresses ----
     // The escrow deadline must outlive the whole auction on both clocks: the
-    // canister checks `deadline ≥ created_at + duration + perform + voting +
-    // margin`, and `create_escrow` refuses a deadline already past on devnet.
+    // canister checks `deadline ≥ created_at + duration + margin`, and
+    // `create_escrow` refuses a deadline already past on devnet.
     let deadline = head_time + 30 * 24 * 3600;
     let recipient_nonce = now_unix; // unique per run → a fresh auction each time
     let auction_id = protocol::auction_id(
@@ -751,15 +710,16 @@ fn main() -> R<()> {
         recipient,
         recipient_nonce,
         DURATION,
-        cfg.perform_window,
-        cfg.voting_period,
         cfg.min_entry,
     );
     let auction_hex = hex::encode(auction_id);
-    println!("\n[4] auction {auction_hex}");
+    println!("\n[3] auction {auction_hex}");
 
     let mut entries = Vec::new();
-    for (label, nonce_bump) in [("a5-winning-bid", 0u64), ("a5-losing-bid", 1u64)] {
+    for (label, nonce_bump, gross) in [
+        ("a5-winning-bid", 0u64, WINNING_GROSS),
+        ("a5-losing-bid", 1u64, LOSING_GROSS),
+    ] {
         let text_hash = sha256(label.as_bytes());
         let lot_id = protocol::lot_id(&auction_id, &text_hash);
         let lot_hex = hex::encode(lot_id);
@@ -776,7 +736,7 @@ fn main() -> R<()> {
                     &lot_hex,
                     &bs58::encode(donor_pk).into_string(),
                     &nonce,
-                    &GROSS,
+                    &gross,
                     &deadline
                 )?,
             )
@@ -788,7 +748,7 @@ fn main() -> R<()> {
         let salt = crown_salt::two_outcome::two_outcome(
             donor_pk,
             recipient,
-            GROSS,
+            gross,
             deadline,
             resolver,
             cfg.fee_bps,
@@ -798,11 +758,12 @@ fn main() -> R<()> {
         let (escrow_arr, _) = crown_derive::solana_pda_address(cfg.factory, &[b"escrow", &salt])
             .ok_or("derive escrow")?;
         let escrow = Pubkey::new_from_array(escrow_arr);
-        println!("    lot {label}: escrow {escrow}");
+        println!("    lot {label}: {gross} minor units, escrow {escrow}");
         entries.push(Entry {
             lot_hex,
             text_hash,
             nonce,
+            gross,
             resolver,
             escrow,
             vault: get_associated_token_address(&escrow, &two_outcome::USDC_MINT),
@@ -811,8 +772,8 @@ fn main() -> R<()> {
         });
     }
 
-    // ---- 5) devnet: fund both escrows for real ----
-    println!("\n[5] devnet: two create_escrow");
+    // ---- 4) devnet: fund both escrows for real ----
+    println!("\n[4] devnet: two create_escrow");
     for e in entries.iter_mut() {
         let ix = Instruction {
             program_id: two_outcome::ID,
@@ -830,7 +791,7 @@ fn main() -> R<()> {
             data: two_outcome::instruction::CreateEscrow {
                 salt: e.salt,
                 recipient: Pubkey::new_from_array(recipient),
-                gross: GROSS,
+                gross: e.gross,
                 deadline,
                 resolver: Pubkey::new_from_array(e.resolver),
                 fee_bps: cfg.fee_bps,
@@ -841,8 +802,8 @@ fn main() -> R<()> {
         };
         e.create_sig = send(&client, &donor_kp, &[ix])?;
         let funded = balance(&client, &e.vault);
-        if funded != GROSS {
-            return Err(format!("vault holds {funded}, expected {GROSS}").into());
+        if funded != e.gross {
+            return Err(format!("vault holds {funded}, expected {}", e.gross).into());
         }
         println!(
             "    create_escrow tx {} — vault funded {funded}",
@@ -850,8 +811,8 @@ fn main() -> R<()> {
         );
     }
 
-    // ---- 6) the index folds both real transactions into births ----
-    println!("\n[6] index: fold both real devnet transactions into births");
+    // ---- 5) the index folds both real transactions into births ----
+    println!("\n[5] index: fold both real devnet transactions into births");
     for e in &entries {
         match ingest(&pic, &client, mock, proxy, index, &e.create_sig)? {
             IngestResult::Applied { births: 1, .. } => {}
@@ -881,8 +842,8 @@ fn main() -> R<()> {
     }
     println!("    ✓ index root authenticated and cached (paid)");
 
-    // ---- 7) register both entries as direct ingress ----
-    println!("\n[7] register both entries (direct ingress)");
+    // ---- 6) register both entries as direct ingress ----
+    println!("\n[6] register both entries (direct ingress)");
     for (i, e) in entries.iter().enumerate() {
         let bq = pic
             .query_call(
@@ -903,10 +864,8 @@ fn main() -> R<()> {
             ("recipient", bs58::encode(recipient).into_string()),
             ("recipient_nonce", recipient_nonce.to_string()),
             ("duration", DURATION.to_string()),
-            ("perform_window", cfg.perform_window.to_string()),
-            ("voting_period", cfg.voting_period.to_string()),
             ("min_entry", cfg.min_entry.to_string()),
-            ("gross", GROSS.to_string()),
+            ("gross", e.gross.to_string()),
             ("deadline", deadline.to_string()),
             ("nonce", e.nonce.to_string()),
             ("witness", hex::encode(&witness)),
@@ -931,14 +890,17 @@ fn main() -> R<()> {
         .map_err(|e| format!("get_auction: {e:?}"))?;
     if !matches!(
         Decode!(&aq, Option<AuctionStateView>)?,
-        Some(AuctionStateView::Bidding)
+        Some(AuctionStateView::Bidding { .. })
     ) {
         return Err("the auction is not in Bidding after registration".into());
     }
     println!("    ✓ both entries registered against real births; auction is Bidding");
 
-    // ---- 8) accept both lots → pick the winner → ready ----
-    println!("\n[8] accept both lots → pick_winner → ready");
+    // ---- 7) accept both lots — the recipient's only lever ----
+    // Accepting is all the recipient can do to the contest, and here they do it
+    // for both lots. From this point nobody influences the outcome: no pick, no
+    // vote, no readiness declaration. Only the two totals matter.
+    println!("\n[7] accept both lots (nobody picks a winner — the money does)");
     for e in &entries {
         let msg = protocol::lot_message(
             "accept",
@@ -959,75 +921,47 @@ fn main() -> R<()> {
             return Err("accept_lot did not advance the lot".into());
         }
     }
-    let pick_msg = protocol::lot_message(
-        "pick",
-        &cfg.chain_id,
-        &game.to_text(),
-        &auction_hex,
-        &entries[0].lot_hex,
-    );
-    let rr = pic
-        .update_call(
-            game,
-            anon(),
-            "pick_winner",
-            Encode!(&signed_request(&recipient_sk, &pick_msg, &[]))?,
-        )
-        .map_err(|e| format!("pick_winner: {e:?}"))?;
-    if !matches!(
-        Decode!(&rr, AuctionResult)?,
-        AuctionResult::Advanced(AuctionStateView::Performing)
-    ) {
-        return Err("pick_winner did not open Performing".into());
+    // The canister's own standing, read back before the close: the numbers the
+    // close will compare are the ones the two real vaults hold.
+    for e in &entries {
+        let lq = pic
+            .query_call(game, anon(), "get_lot", Encode!(&auction_hex, &e.lot_hex)?)
+            .map_err(|err| format!("get_lot: {err:?}"))?;
+        let view = Decode!(&lq, Option<LotView>)?.ok_or("lot must exist")?;
+        let total = view.total;
+        if !view.accepted || total != e.gross as u128 {
+            return Err(format!(
+                "lot standing is (accepted {}, total {total}), expected (true, {})",
+                view.accepted, e.gross
+            )
+            .into());
+        }
+        println!("    lot {} accepted, standing {total}", &e.lot_hex[..8]);
     }
-    let ready_msg =
-        protocol::auction_message("ready", &cfg.chain_id, &game.to_text(), &auction_hex);
-    let rr = pic
-        .update_call(
-            game,
-            anon(),
-            "ready",
-            Encode!(&signed_request(&recipient_sk, &ready_msg, &[]))?,
-        )
-        .map_err(|e| format!("ready: {e:?}"))?;
-    if !matches!(
-        Decode!(&rr, AuctionResult)?,
-        AuctionResult::Advanced(AuctionStateView::Voting)
-    ) {
-        return Err("ready did not open Voting".into());
-    }
-    println!("    ✓ winner picked, work declared ready, voting open");
+    println!("    ✓ both lots compete; the heavier one is worth {WINNING_GROSS}");
 
-    // ---- 9) vote with the real book weight ----
-    println!("\n[9] vote (weight = real book reputation, proven against the cached root)");
-    let (_, weight_witness) = reputation(&pic, index, &chain, &donor_pk, &recipient)?;
-    let vote_msg = protocol::vote_message(
-        &cfg.chain_id,
-        &game.to_text(),
-        &auction_hex,
-        &entries[0].lot_hex,
-        "done",
-    );
-    let extras = vec![("weight_witness", hex::encode(&weight_witness))];
-    let rr = pic
-        .update_call(
-            game,
-            anon(),
-            "vote",
-            Encode!(&signed_request(&donor_sk, &vote_msg, &extras))?,
-        )
-        .map_err(|e| format!("vote (a valid vote must pass the boundary): {e:?}"))?;
-    if !matches!(
-        Decode!(&rr, AuctionResult)?,
-        AuctionResult::Advanced(AuctionStateView::Voting)
-    ) {
-        return Err("the vote was not recorded".into());
+    // ---- 8) the bidding window shuts by itself → two verdicts ----
+    // No call closes the auction: the clock does. The first request_signature
+    // past `T` finds `Done{winner_lot}` already computed from the standings, and
+    // that is the whole decision procedure.
+    println!("\n[8] the bidding window shuts on its own → request_signature per entry");
+    pic.advance_time(std::time::Duration::from_secs(DURATION + 1));
+    let aq = pic
+        .query_call(game, anon(), "get_auction", Encode!(&auction_hex)?)
+        .map_err(|e| format!("get_auction: {e:?}"))?;
+    match Decode!(&aq, Option<AuctionStateView>)? {
+        Some(AuctionStateView::Done {
+            winner_lot: Some(w),
+        }) if w == entries[0].lot_hex => {}
+        other => {
+            return Err(format!(
+                "the close must name the heavier lot {}, got {other:?}",
+                entries[0].lot_hex
+            )
+            .into())
+        }
     }
-    println!("    ✓ vote recorded with weight {weight}");
-
-    // ---- 10) the window closes → two verdicts under two leaf resolvers ----
-    println!("\n[10] voting window closes → request_signature per entry");
-    pic.advance_time(std::time::Duration::from_secs(cfg.voting_period + 1));
+    println!("    ✓ the close named the heavier lot — no vote, no pick");
     let mut signatures = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         let expected = if i == 0 { SETTLE } else { CANCEL };
@@ -1074,8 +1008,8 @@ fn main() -> R<()> {
         }
     }
 
-    // ---- 11) devnet: claim the winner, cancel the loser ----
-    println!("\n[11] devnet: claim(settle) for the winner, claim(cancel) for the loser");
+    // ---- 9) devnet: claim the winner, cancel the loser ----
+    println!("\n[9] devnet: claim(settle) for the winner, claim(cancel) for the loser");
     // Both payout ATAs must exist even for a cancel — `claim` resolves the
     // accounts before it knows the outcome.
     send(
@@ -1087,8 +1021,8 @@ fn main() -> R<()> {
         ],
     )?;
 
-    let fee = (GROSS as u128 * cfg.fee_bps as u128 / 10_000) as u64;
-    let net = GROSS - fee;
+    let fee = (WINNING_GROSS as u128 * cfg.fee_bps as u128 / 10_000) as u64;
+    let net = WINNING_GROSS - fee;
     let recipient_before = balance(&client, &recipient_ata);
     let fee_before = balance(&client, &fee_ata);
     let donor_before = balance(&client, &donor_ata);
@@ -1151,19 +1085,19 @@ fn main() -> R<()> {
     }
     // The loser's whole gross comes back; the winner's leaves. The donor is the
     // same wallet for both, so the net movement is exactly the loser's refund.
-    if donor_after != donor_before + GROSS {
+    if donor_after != donor_before + LOSING_GROSS {
         return Err(format!(
-            "donor got back {}, expected the loser's {GROSS}",
+            "donor got back {}, expected the loser's {LOSING_GROSS}",
             donor_after - donor_before
         )
         .into());
     }
     println!(
-        "    ✓ recipient +{net}, fee wallet +{fee}, loser's donor +{GROSS}, both vaults closed"
+        "    ✓ recipient +{net}, fee wallet +{fee}, loser's donor +{LOSING_GROSS}, both vaults closed"
     );
 
-    // ---- 12) the settlement flows back into the book, to the donor ----
-    println!("\n[12] index: fold the settlement → reputation lands on the donor");
+    // ---- 10) the settlement flows back into the book, to the donor ----
+    println!("\n[10] index: fold the settlement → reputation lands on the donor");
     match ingest(&pic, &client, mock, proxy, index, &settle_sig)? {
         IngestResult::Applied {
             settlements: 1,
@@ -1173,12 +1107,8 @@ fn main() -> R<()> {
         other => return Err(format!("the settlement did not fold: {other:?}").into()),
     }
     let (after, _) = reputation(&pic, index, &chain, &donor_pk, &recipient)?;
-    if after != SEED_GROSS as u128 + net as u128 {
-        return Err(format!(
-            "reputation is {after}, expected {}",
-            SEED_GROSS as u128 + net as u128
-        )
-        .into());
+    if after != net as u128 {
+        return Err(format!("reputation is {after}, expected {net}").into());
     }
     // …and not to the escrow address, which is the silent, permanent failure mode
     // an index without the birth would fall into (`00 §4`).
@@ -1194,6 +1124,6 @@ fn main() -> R<()> {
     }
     println!("    ✓ donor reputation {after}; the escrow address holds none");
 
-    println!("\nA5 PASSED — real escrows, real book weight, real threshold verdicts, real settle + refund on devnet.");
+    println!("\nA5 PASSED — real escrows, the heavier bid won on arithmetic alone, real threshold verdicts, real settle + refund on devnet.");
     Ok(())
 }

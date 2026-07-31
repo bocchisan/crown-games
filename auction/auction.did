@@ -7,14 +7,11 @@ type AuctionResult = variant {
   EntryNotFound;
   DuplicateEscrow;
   DurationOutOfRange;
-  Derived : record { auction : text };
   // A certified index root was authenticated and cached.
   RootPushed;
-  VoteCapReached;
   InvalidTransition;
   NotFound;
   NotBootstrapped;
-  VotingPeriodOutOfRange;
   KeyBootstrapped;
   EntryReturned;
   AlreadyExists;
@@ -24,38 +21,40 @@ type AuctionResult = variant {
   Malformed;
   FieldMismatch;
   NotDecided;
-  LotNotAccepted;
   Materialized;
   LotAlreadyAccepted;
+  // A lot's running total would exceed `u128` — refused, never clamped.
+  TotalOverflow;
   // A sibling call is already signing this entry scope — free, no charge.
   // Retry and the produced signature is served from store.
   SignInFlight;
   SignFailed;
-  DuplicateVoter;
   Signed : SignatureView;
   CreatedAtOverflow;
-  PerformWindowOutOfRange;
   Registered;
   WrongTarget;
   DeadlineTooTight;
   StepOverflow;
   LotReturned;
-  WeightBelowThreshold;
   NotRecipient;
 };
-// An auction's state, for `get_auction` / `Advanced`.
+// An auction's state, for `get_auction` / `Advanced`. `Done` carries the lot the
+// close named — `None` when nobody won (cancelled, or no eligible lot stood).
 type AuctionStateView = variant {
-  DoneSettle;
-  DoneNoWinner;
-  DoneCancel;
-  Bidding;
-  Voting;
-  Performing;
+  Done : record { winner_lot : opt text };
+  // Open, and `closes_at` is when it stops being open — the instant the
+  // heaviest lot wins. Exposed because `created_at` is fixed by the birth slot
+  // of whoever registered first, so the recipient's advertised `duration` does
+  // **not** tell a bidder how long is left; without this number a bidder can
+  // only guess whether their top-up will land before the close.
+  Bidding : record { closes_at : nat64 };
 };
 // Deploy-time overrides (testnet). Barred on mainnet.
 type InitArgs = record { nns_root_key : blob; index : principal };
-// A lot's public view.
+// A lot's public view. `total` is the sum of its live entries — the number the
+// close compares, so a donor can see the standing they are bidding against.
 type LotView = record {
+  total : nat;
   live_entries : nat64;
   accepted : bool;
   returned : bool;
@@ -69,33 +68,21 @@ service : (opt InitArgs) -> {
   bootstrap : () -> (AuctionResult);
   cancel_auction : (text) -> (AuctionResult);
   get_auction : (text) -> (opt AuctionStateView) query;
-  // Pure derivation echo (recipient-signed, zero writes, permissionless):
-  // `admit_create` recomputes `auction_id` and confirms it matches the signed
-  // `auction`; here we just echo the derived id. Materialization happens later, on
-  // the first confirmed entry (`register_entry`).
-  //
-  // A `query`, and that is the whole point (`P7.15`, spec §Таблица переходов ¹).
-  // It reads no mutable state and writes none, so as an `update` it made the
-  // entire subnet recompute — replicated, at this canister's expense — what one
-  // node can compute. Worse, it was the one state-changing entry point whose
-  // admissibility depended on nothing external: a fresh keypair signs its own
-  // message and `auction_id` recomputes from its own fields, so the boundary
-  // admitted it *always*. No dedup, no cap, no cost to the caller. The reference
-  // game has no such method at all — `task_id` is derived client-side and the
-  // first touch is already a birth-proved `register_task`.
-  get_auction_id : (text) -> (AuctionResult) query;
   get_logic_version : () -> (nat32) query;
   get_lot : (text, text) -> (opt LotView) query;
-  // The resolver a donor bakes into their escrow for entry `(lot, donor, nonce)`:
-  // `key([entry_id])`, `entry_id = sha256(lot ‖ donor ‖ nonce)`. Per-entry, so the
+  // The resolver a donor bakes into their escrow for entry
+  // `(lot, donor, nonce, gross, deadline)`: `key([entry_id])`. Per-entry, so the
   // verdict signed under it settles only this one escrow. Free, pure derivation.
+  // 
+  // `gross`/`deadline` are arguments because the scope commits them (`protocol`):
+  // they are the fields the escrow address derives from, and a resolver that
+  // ignored them would be shared by every escrow a donor funds under one nonce.
+  // The donor already knows both — they are the escrow they are about to create.
   get_resolver : (text, text, nat64, nat64, int64) -> (opt text) query;
   // The verdict signature already produced for an entry, if any. Free query — a
   // claimer that lost the race, or one that simply needs the bytes again, reads
   // them here instead of paying the relay to re-request a `SIGN_PRICE` pull.
   get_signature : (text, text, text) -> (opt SignatureView) query;
-  // The recipient names the winning lot (accepted, non-returned) → `Performing`.
-  pick_winner : (text) -> (AuctionResult);
   // Paid pull (fronted by the relay for `ROOT_PRICE`): authenticate a fresh index
   // root and cache it, so the anonymous boundary can admit birth/reputation
   // witnesses with a hash-tree walk alone.
@@ -110,7 +97,6 @@ service : (opt InitArgs) -> {
   // refunded: fund-then-fail must not be cheaper than the work it triggers
   // (`01-standards §Тесты 4`).
   push_root : (blob) -> (AuctionResult);
-  ready : (text) -> (AuctionResult);
   // Materialization carrier (donor-signed): the boundary-shared `admit_register_entry`
   // verifies the contribution's birth at the derived escrow (the time-free prefix,
   // run at the boundary and re-run here authoritatively); this body performs only
@@ -118,16 +104,10 @@ service : (opt InitArgs) -> {
   // `created_at`), gate the entry against the fixed timeline, and add it to its lot.
   register_entry : (text) -> (AuctionResult);
   // Paid pull: the three-stage resolution → one signature under the escrow's own
-  // leaf scope (`key([entry_id])`). In `Bidding` (winner not yet picked) there is
-  // no verdict and no charge; `NoVerdict` (winner in `Performing`/`Voting`) also
-  // refuses without charge. Payment is accepted only when there is a verdict,
-  // before `sign_with_schnorr`.
+  // leaf scope (`key([entry_id])`). While `Bidding` the standing can still move, so
+  // there is no verdict and no charge. Payment is accepted only when there is a
+  // verdict, before `sign_with_schnorr`.
   request_signature : (text, text, text, text) -> (AuctionResult);
   return_entry : (text) -> (AuctionResult);
   return_lot : (text) -> (AuctionResult);
-  // A reputation-weighted vote on the winner lot (`Voting`). Validity (signature +
-  // weight proof ≥ `MIN_VOTE_WEIGHT`) is gated at the boundary via `admit_vote`; here
-  // the same check runs authoritatively, then the dedup + `V_MAX` cap apply in the
-  // machine/state. Weight = the voter's reputation to the auction's recipient.
-  vote : (text) -> (AuctionResult);
 }

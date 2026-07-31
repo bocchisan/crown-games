@@ -17,16 +17,13 @@ pub const DOMAIN: &str = "crown:auction:v1";
 const AUCTION_ID_PREFIX: &[u8] = b"crown:auction";
 
 /// Free `scope_id` of an auction — recipient + nonce + the rules snapshot
-/// (timings + `min_entry`), all committed so the canister recomputes and verifies
-/// it at materialization. Does **not** commit any per-lot `text_hash`.
-#[allow(clippy::too_many_arguments)]
+/// (`duration` + `min_entry`), all committed so the canister recomputes and
+/// verifies it at materialization. Does **not** commit any per-lot `text_hash`.
 pub fn auction_id(
     canister: &[u8],
     recipient: [u8; 32],
     recipient_nonce: u64,
     duration: u64,
-    perform_window: u64,
-    voting_period: u64,
     min_entry: u64,
 ) -> [u8; 32] {
     let mut h = Sha256::new();
@@ -36,16 +33,14 @@ pub fn auction_id(
     h.update(recipient);
     h.update(recipient_nonce.to_le_bytes());
     h.update(duration.to_le_bytes());
-    h.update(perform_window.to_le_bytes());
-    h.update(voting_period.to_le_bytes());
     h.update(min_entry.to_le_bytes());
     h.finalize().into()
 }
 
 /// Per-lot scope: `lot_id = sha256(auction_id ‖ text_hash)`. The escrow commits
 /// transitively to the timings via `resolver → entry_id → lot_id → auction_id`.
-/// A lot is the *contest* group (whose sums compete, whom the vote judges); it is
-/// **not** the settlement scope — `return_entry` lets entries in one lot diverge.
+/// A lot is the *contest* group (whose sums compete); it is **not** the settlement
+/// scope — `return_entry` lets entries in one lot diverge.
 pub fn lot_id(auction_id: &[u8; 32], text_hash: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(auction_id);
@@ -96,26 +91,6 @@ fn head(action: &str, chain: &str, canister: &str, auction_hex: &str) -> String 
     )
 }
 
-/// `create` (recipient signs) — declares the auction and its rule snapshot.
-pub fn create_message(
-    chain: &str,
-    canister: &str,
-    auction_hex: &str,
-    duration: u64,
-    perform_window: u64,
-    voting_period: u64,
-    min_entry: u64,
-) -> String {
-    format!(
-        "{}\nduration: {}\nperform_window: {}\nvoting_period: {}\nmin_entry: {}",
-        head("create", chain, canister, auction_hex),
-        duration,
-        perform_window,
-        voting_period,
-        min_entry
-    )
-}
-
 /// `register` (donor signs) — commits to the lot's `text_hash` (its bid
 /// condition); the birth proof and escrow fields ride as unsigned extras.
 pub fn register_message(chain: &str, canister: &str, auction_hex: &str, text_hex: &str) -> String {
@@ -157,25 +132,9 @@ pub fn return_entry_message(
     )
 }
 
-/// An auction-scoped recipient action (`ready` / `cancel`).
+/// An auction-scoped recipient action (`cancel`).
 pub fn auction_message(action: &str, chain: &str, canister: &str, auction_hex: &str) -> String {
     head(action, chain, canister, auction_hex)
-}
-
-/// `vote` (voter signs) — the lot and the choice (`done` / `not_done`).
-pub fn vote_message(
-    chain: &str,
-    canister: &str,
-    auction_hex: &str,
-    lot_hex: &str,
-    choice: &str,
-) -> String {
-    format!(
-        "{}\nlot: {}\nchoice: {}",
-        head("vote", chain, canister, auction_hex),
-        lot_hex,
-        choice
-    )
 }
 
 #[cfg(test)]
@@ -185,7 +144,7 @@ mod tests {
 
     #[test]
     fn auction_id_is_byte_exact_and_commits_every_field() {
-        let base = auction_id(b"cid", [1; 32], 5, 600, 300, 120, 0);
+        let base = auction_id(b"cid", [1; 32], 5, 600, 0);
         let mut h = Sha256::new();
         h.update(b"crown:auction");
         h.update([3u8]);
@@ -193,27 +152,23 @@ mod tests {
         h.update([1u8; 32]);
         h.update(5u64.to_le_bytes());
         h.update(600u64.to_le_bytes());
-        h.update(300u64.to_le_bytes());
-        h.update(120u64.to_le_bytes());
         h.update(0u64.to_le_bytes());
         let expected: [u8; 32] = h.finalize().into();
         assert_eq!(base, expected);
 
-        assert_ne!(base, auction_id(b"cid2", [1; 32], 5, 600, 300, 120, 0));
-        assert_ne!(base, auction_id(b"cid", [9; 32], 5, 600, 300, 120, 0));
-        assert_ne!(base, auction_id(b"cid", [1; 32], 6, 600, 300, 120, 0));
-        assert_ne!(base, auction_id(b"cid", [1; 32], 5, 601, 300, 120, 0));
-        assert_ne!(base, auction_id(b"cid", [1; 32], 5, 600, 301, 120, 0));
-        assert_ne!(base, auction_id(b"cid", [1; 32], 5, 600, 300, 121, 0));
-        assert_ne!(base, auction_id(b"cid", [1; 32], 5, 600, 300, 120, 1));
+        assert_ne!(base, auction_id(b"cid2", [1; 32], 5, 600, 0));
+        assert_ne!(base, auction_id(b"cid", [9; 32], 5, 600, 0));
+        assert_ne!(base, auction_id(b"cid", [1; 32], 6, 600, 0));
+        assert_ne!(base, auction_id(b"cid", [1; 32], 5, 601, 0));
+        assert_ne!(base, auction_id(b"cid", [1; 32], 5, 600, 1));
     }
 
     #[test]
     fn lot_id_binds_auction_and_text() {
-        let a = auction_id(b"cid", [1; 32], 5, 600, 300, 120, 0);
+        let a = auction_id(b"cid", [1; 32], 5, 600, 0);
         let base = lot_id(&a, &[7; 32]);
         assert_ne!(base, lot_id(&a, &[8; 32])); // different text
-        let a2 = auction_id(b"cid", [2; 32], 5, 600, 300, 120, 0);
+        let a2 = auction_id(b"cid", [2; 32], 5, 600, 0);
         assert_ne!(base, lot_id(&a2, &[7; 32])); // different auction
                                                  // Byte layout.
         let mut h = Sha256::new();
@@ -277,20 +232,22 @@ mod tests {
     #[test]
     fn messages_are_byte_exact() {
         assert_eq!(
-            create_message("devnet", "aaaaa-aa", "ab", 600, 300, 120, 0),
-            "crown:auction:v1\naction: create\nchain: devnet\ncanister: aaaaa-aa\nauction: ab\nduration: 600\nperform_window: 300\nvoting_period: 120\nmin_entry: 0"
+            register_message("devnet", "aaaaa-aa", "ab", "cd"),
+            "crown:auction:v1\naction: register\nchain: devnet\ncanister: aaaaa-aa\nauction: ab\ntext: cd"
         );
         assert_eq!(
-            vote_message("devnet", "aaaaa-aa", "ab", "cd", "done"),
-            "crown:auction:v1\naction: vote\nchain: devnet\ncanister: aaaaa-aa\nauction: ab\nlot: cd\nchoice: done"
+            return_entry_message("devnet", "aaaaa-aa", "ab", "cd", "Esc"),
+            "crown:auction:v1\naction: return_entry\nchain: devnet\ncanister: aaaaa-aa\nauction: ab\nlot: cd\nentry: Esc"
         );
+        // The action is inside the signed bytes, so one signature never doubles
+        // as another action's — the two returns in particular.
         assert_ne!(
             lot_message("accept", "devnet", "c", "a", "l"),
             lot_message("return_lot", "devnet", "c", "a", "l")
         );
         assert_ne!(
-            auction_message("ready", "devnet", "c", "a"),
-            auction_message("cancel", "devnet", "c", "a")
+            auction_message("cancel", "devnet", "c", "a"),
+            auction_message("cancel", "devnet", "c", "b")
         );
     }
 
@@ -298,11 +255,11 @@ mod tests {
     fn a_real_signature_verifies_and_tampering_fails() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let pk = sk.verifying_key().to_bytes();
-        let msg = auction_message("ready", "devnet", "aaaaa-aa", "auc1");
+        let msg = auction_message("cancel", "devnet", "aaaaa-aa", "auc1");
         let sig = sk.sign(msg.as_bytes()).to_bytes();
         assert!(verify(&msg, &pk, &sig));
         assert!(!verify(
-            &auction_message("cancel", "devnet", "aaaaa-aa", "auc1"),
+            &auction_message("cancel", "devnet", "aaaaa-aa", "auc2"),
             &pk,
             &sig
         ));

@@ -1,8 +1,6 @@
 # auction — mainnet-профиль.
 crown_index   = "PLACEHOLDER_indexer_mainnet_principal"
 threshold_key = "key_1"
-voting_period  = 3600                       # mainnet; в прообразе auction_id
-perform_window = 86_400
 min_entry      = 1_860_000
 sign_price     = 35_800_000_000             # цена подписи вклада (harness §5; ≤ релейного SIGN_PRICE)
 root_price     = 1_400_000_000              # цена обновления корня индекса (BLS-пары сертификата); cost-gate P8

@@ -1,22 +1,22 @@
-//! auction canister — a lot auction on the `two-outcome` form. Blind: bids are
-//! confirmed by a birth proof (not chain reads); the canister is blind to amounts.
-//! A lot is a contest group; a contribution is the settlement unit
+//! auction canister — a lot auction on the `two-outcome` form. Blind to the
+//! chain: bids are confirmed by a birth proof, never a chain read. A lot is a
+//! contest group; a contribution is the settlement unit
 //! (`resolver = key([entry_id])`).
 //!
-//! `get_auction_id` is a pure derivation echo (zero writes, permissionless) and a
-//! `query` — as an `update` it was replicated free work on the anonymous path.
+//! **The heaviest bid wins, and nothing else decides it.** At `T = created_at +
+//! duration` the window shuts and the accepted, unreturned lot with the greatest
+//! live total settles; every other contribution cancels. There is no vote and no
+//! `pick_winner` — the close is one pass over the lots, run lazily on the first
+//! call after `T` and then frozen (`Done` is absorbing).
+//!
 //! `register_entry` (donor-signed) is the materialization carrier: it verifies the
 //! contribution's birth at the derived escrow, materializes the auction on the
 //! first confirmed entry (fixing `created_at`), and adds the entry to its lot.
-//! The recipient runs the auction — `accept_lot`/`return_lot`/`return_entry`/
-//! `pick_winner`/`cancel_auction`/`ready` — all signature-gated by the recipient.
-//! There is no on-chain winner scan: the recipient names the winner (`pick_winner`).
-//! `vote` (winner lot) and `request_signature` (per-entry verdict) settle it.
+//! The recipient curates the contest before the close —
+//! `accept_lot`/`return_lot`/`return_entry`/`cancel_auction`, all signature-gated
+//! by the recipient — and `request_signature` (per-entry verdict) settles it.
 
-use auction_logic::{
-    resolve, ActionKind, Auction, Known, Outcome, Resolution, State, Vote, LOGIC_VERSION,
-    MIN_VOTE_WEIGHT,
-};
+use auction_logic::{resolve, Auction, Known, Resolution, State, LOGIC_VERSION};
 use candid::{CandidType, Deserialize, Principal};
 use ic_cdk_management_canister::{
     schnorr_public_key, sign_with_schnorr, SchnorrAlgorithm, SchnorrKeyId, SchnorrPublicKeyArgs,
@@ -32,8 +32,10 @@ pub mod validate;
 // The delicate, game-agnostic crypto (birth/reputation proof, threshold resolver
 // derivation, escrow-address PDA, wallet signature, request framing) lives in
 // `crown-games-common`. Re-exported to keep call sites uniform across every game.
+// `V_MAX` is deliberately **not** re-exported: it caps votes per scope, and this
+// game has no vote. It stays in `crown-games-common` for the games that do.
 pub use crown_games_common::{
-    address, birth, bs58_array, field, request, resolver, roots, signing, MAX_ARG_BYTES, V_MAX,
+    address, birth, bs58_array, field, request, resolver, roots, signing, MAX_ARG_BYTES,
 };
 
 thread_local! {
@@ -57,23 +59,31 @@ pub struct InitArgs {
     pub nns_root_key: Vec<u8>,
 }
 
-/// An auction's state, for `get_auction` / `Advanced`.
-#[derive(CandidType, Deserialize, Clone, Copy, Debug)]
+/// An auction's state, for `get_auction` / `Advanced`. `Done` carries the lot the
+/// close named — `None` when nobody won (cancelled, or no eligible lot stood).
+#[derive(CandidType, Deserialize, Clone, Debug)]
 pub enum AuctionStateView {
-    Bidding,
-    Performing,
-    Voting,
-    DoneSettle,
-    DoneCancel,
-    DoneNoWinner,
+    /// Open, and `closes_at` is when it stops being open — the instant the
+    /// heaviest lot wins. Exposed because `created_at` is fixed by the birth slot
+    /// of whoever registered first, so the recipient's advertised `duration` does
+    /// **not** tell a bidder how long is left; without this number a bidder can
+    /// only guess whether their top-up will land before the close.
+    Bidding {
+        closes_at: u64,
+    },
+    Done {
+        winner_lot: Option<String>,
+    },
 }
 
-/// A lot's public view.
+/// A lot's public view. `total` is the sum of its live entries — the number the
+/// close compares, so a donor can see the standing they are bidding against.
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct LotView {
     pub accepted: bool,
     pub returned: bool,
     pub live_entries: u64,
+    pub total: u128,
     pub text_hash: String,
 }
 
@@ -90,9 +100,6 @@ pub enum AuctionResult {
     // success
     Materialized,
     Registered,
-    Derived {
-        auction: String,
-    },
     Advanced(AuctionStateView),
     KeyBootstrapped,
     Signed {
@@ -118,8 +125,6 @@ pub enum AuctionResult {
     // registration validation
     GrossBelowMinEntry,
     DurationOutOfRange,
-    PerformWindowOutOfRange,
-    VotingPeriodOutOfRange,
     DeadlineTooTight,
     TimeOverflow,
     // state
@@ -129,15 +134,13 @@ pub enum AuctionResult {
     LotNotFound,
     LotReturned,
     LotAlreadyAccepted,
-    LotNotAccepted,
     EntryNotFound,
     EntryReturned,
     DuplicateEscrow,
-    VoteCapReached,
+    /// A lot's running total would exceed `u128` — refused, never clamped.
+    TotalOverflow,
     // step
     InvalidTransition,
-    WeightBelowThreshold,
-    DuplicateVoter,
     StepOverflow,
 }
 
@@ -187,30 +190,6 @@ async fn bootstrap() -> AuctionResult {
     AuctionResult::KeyBootstrapped
 }
 
-/// Pure derivation echo (recipient-signed, zero writes, permissionless):
-/// `admit_create` recomputes `auction_id` and confirms it matches the signed
-/// `auction`; here we just echo the derived id. Materialization happens later, on
-/// the first confirmed entry (`register_entry`).
-///
-/// A `query`, and that is the whole point (`P7.15`, spec §Таблица переходов ¹).
-/// It reads no mutable state and writes none, so as an `update` it made the
-/// entire subnet recompute — replicated, at this canister's expense — what one
-/// node can compute. Worse, it was the one state-changing entry point whose
-/// admissibility depended on nothing external: a fresh keypair signs its own
-/// message and `auction_id` recomputes from its own fields, so the boundary
-/// admitted it *always*. No dedup, no cap, no cost to the caller. The reference
-/// game has no such method at all — `task_id` is derived client-side and the
-/// first touch is already a birth-proved `register_task`.
-#[ic_cdk::query]
-fn get_auction_id(text: String) -> AuctionResult {
-    match admit_create(&text) {
-        Ok(id) => AuctionResult::Derived {
-            auction: hex::encode(id),
-        },
-        Err(e) => e,
-    }
-}
-
 /// Materialization carrier (donor-signed): the boundary-shared `admit_register_entry`
 /// verifies the contribution's birth at the derived escrow (the time-free prefix,
 /// run at the boundary and re-run here authoritatively); this body performs only
@@ -230,7 +209,7 @@ fn register_entry(text: String) -> AuctionResult {
         // Validate EVERYTHING that could reject the first entry BEFORE committing
         // `materialize` — a rejected first entry must not leave a zombie auction
         // (materialized, zero live entries, and idempotent → never re-materializable).
-        if let Err(e) = validate::validate_ranges(r.duration, r.perform_window, r.voting_period) {
+        if let Err(e) = validate::validate_ranges(r.duration) {
             return reg_error(e);
         }
         let Some(created_at) = config::slot_to_created_at(r.birth.slot) else {
@@ -242,8 +221,6 @@ fn register_entry(text: String) -> AuctionResult {
             r.deadline,
             created_at,
             r.duration,
-            r.perform_window,
-            r.voting_period,
         ) {
             return reg_error(e);
         }
@@ -260,10 +237,6 @@ fn register_entry(text: String) -> AuctionResult {
             state: State::Bidding,
             created_at,
             duration: r.duration,
-            perform_window: r.perform_window,
-            voting_period: r.voting_period,
-            winner_lot: None,
-            votes: Vec::new(),
         };
         // Now nothing below can fail on a fresh auction: window open + not-tight are
         // proven, and a fresh auction has no duplicate/returned to hit.
@@ -274,7 +247,7 @@ fn register_entry(text: String) -> AuctionResult {
         // Top-up into an existing auction: gate against its fixed created_at. A
         // closed window just rejects the top-up in `add_entry` — no zombie, the
         // auction already exists.
-        let Some((created_at, dur, pw, vp, floor)) = state::timing(&r.auction_id) else {
+        let Some((created_at, dur, floor)) = state::timing(&r.auction_id) else {
             return AuctionResult::NotFound;
         };
         if let Err(e) = validate::validate_entry(
@@ -283,8 +256,6 @@ fn register_entry(text: String) -> AuctionResult {
             r.deadline,
             created_at,
             dur,
-            pw,
-            vp,
         ) {
             return reg_error(e);
         }
@@ -296,6 +267,7 @@ fn register_entry(text: String) -> AuctionResult {
         r.lot_id,
         r.entry_id,
         r.escrow,
+        r.gross,
         now_secs(),
     ) {
         Ok(()) if materialized_now => AuctionResult::Materialized,
@@ -306,16 +278,22 @@ fn register_entry(text: String) -> AuctionResult {
 
 #[ic_cdk::update]
 fn accept_lot(text: String) -> AuctionResult {
-    lot_action(&text, "accept", |auction_id, signer, lot_id, now| {
-        state::accept_lot(auction_id, signer, lot_id, now)
-    })
+    lot_action(
+        &text,
+        "accept",
+        state::Target::LotToAccept,
+        state::accept_lot,
+    )
 }
 
 #[ic_cdk::update]
 fn return_lot(text: String) -> AuctionResult {
-    lot_action(&text, "return_lot", |auction_id, signer, lot_id, now| {
-        state::return_lot(auction_id, signer, lot_id, now)
-    })
+    lot_action(
+        &text,
+        "return_lot",
+        state::Target::LotToReturn,
+        state::return_lot,
+    )
 }
 
 #[ic_cdk::update]
@@ -330,42 +308,11 @@ fn return_entry(text: String) -> AuctionResult {
     }
 }
 
-/// The recipient names the winning lot (accepted, non-returned) → `Performing`.
-#[ic_cdk::update]
-fn pick_winner(text: String) -> AuctionResult {
-    lot_action(&text, "pick", |auction_id, signer, lot_id, now| {
-        state::pick_winner(auction_id, signer, lot_id, now)
-    })
-}
-
 #[ic_cdk::update]
 fn cancel_auction(text: String) -> AuctionResult {
     auction_action(&text, "cancel", |auction_id, signer, now| {
         state::cancel_auction(auction_id, signer, now)
     })
-}
-
-#[ic_cdk::update]
-fn ready(text: String) -> AuctionResult {
-    auction_action(&text, "ready", |auction_id, signer, now| {
-        state::ready(auction_id, signer, now)
-    })
-}
-
-/// A reputation-weighted vote on the winner lot (`Voting`). Validity (signature +
-/// weight proof ≥ `MIN_VOTE_WEIGHT`) is gated at the boundary via `admit_vote`; here
-/// the same check runs authoritatively, then the dedup + `V_MAX` cap apply in the
-/// machine/state. Weight = the voter's reputation to the auction's recipient.
-#[ic_cdk::update]
-fn vote(text: String) -> AuctionResult {
-    let (auction_id, v) = match admit_vote(&text) {
-        Ok(x) => x,
-        Err(e) => return e,
-    };
-    match state::add_vote(&auction_id, v, now_secs(), V_MAX) {
-        Ok(s) => AuctionResult::Advanced(state_view(&s)),
-        Err(e) => state_error(e),
-    }
 }
 
 /// The boundary (non-negativity invariant #2, harness §6): a state-changing ingress
@@ -428,10 +375,9 @@ fn push_root(cert: Vec<u8>) -> AuctionResult {
 }
 
 /// Paid pull: the three-stage resolution → one signature under the escrow's own
-/// leaf scope (`key([entry_id])`). In `Bidding` (winner not yet picked) there is
-/// no verdict and no charge; `NoVerdict` (winner in `Performing`/`Voting`) also
-/// refuses without charge. Payment is accepted only when there is a verdict,
-/// before `sign_with_schnorr`.
+/// leaf scope (`key([entry_id])`). While `Bidding` the standing can still move, so
+/// there is no verdict and no charge. Payment is accepted only when there is a
+/// verdict, before `sign_with_schnorr`.
 #[ic_cdk::update]
 async fn request_signature(
     chain: String,
@@ -464,60 +410,67 @@ async fn request_signature(
         return AuctionResult::Underpaid;
     }
     let now = now_secs();
-    let Some(st) = state::auction_state(&auction_id, now) else {
+    let Some(v) = state::auction_state(&auction_id, now) else {
         return AuctionResult::NotFound;
     };
-    match st {
-        // Winner not yet picked → no verdict, no charge.
-        State::Bidding => AuctionResult::NotDecided,
-        // The three-stage resolution → one signature over the outcome, per entry.
-        State::Performing | State::Voting { .. } | State::Done { .. } => {
-            let entry = state::entry_status(&auction_id, &lot_id, &escrow);
-            let lot_status = state::lot_status(&auction_id, &lot_id);
-            let is_winner = state::winner_lot(&auction_id) == Some(lot_id);
-            let outcome = match resolve(entry, lot_status, is_winner, &st) {
-                Resolution::Settle => 0u8,
-                Resolution::Cancel => 1u8,
-                Resolution::NoVerdict => return AuctionResult::NotDecided, // no charge
-            };
-            // Sign under the entry's own leaf scope so the verdict names exactly
-            // this escrow — a settle for one entry can never claim a sibling that
-            // should cancel. An unregistered escrow has no scope here and recovers
-            // on-chain via the deadline refund (no charge).
-            let Some(entry_scope) = state::entry_scope(&auction_id, &lot_id, &escrow) else {
-                return AuctionResult::EntryNotFound;
-            };
-            // Claim the scope *before* the await: the store only lands after it,
-            // so without this N concurrent requests for one entry would each miss
-            // the store and each pay. A losing sibling is free — it retries and
-            // finds the stored signature.
-            if !signing::claim(entry_scope) {
-                return AuctionResult::SignInFlight;
+    let st = v.state;
+    // The three-stage resolution, **whole** — the state is stage 3, not a gate in
+    // front of it. Stages 1 and 2 (a returned entry, a returned lot) are already
+    // terminal and immutable while the auction is still `Bidding`: nothing
+    // un-returns, and neither can ever be the winner. Short-circuiting `Bidding`
+    // here used to hide them, so a lot the recipient returned on day 1 of a 30-day
+    // auction could not be refunded until the close — its donors' money sat locked
+    // behind a decision that had already been made.
+    //
+    // The winner comes straight from the state `auction_state` just advanced: the
+    // close computed it, and `Done` is absorbing, so it cannot move under a
+    // concurrent claim.
+    let entry = state::entry_status(&auction_id, &lot_id, &escrow);
+    let lot_status = state::lot_status(&auction_id, &lot_id);
+    let is_winner = matches!(st, State::Done { winner_lot } if winner_lot == Some(lot_id));
+    let outcome = match resolve(entry, lot_status, is_winner, &st) {
+        Resolution::Settle => 0u8,
+        Resolution::Cancel => 1u8,
+        // Still bidding and nothing terminal about this entry — the standing can
+        // still move, so there is no verdict to sell. No charge.
+        Resolution::NoVerdict => return AuctionResult::NotDecided,
+    };
+    // Sign under the entry's own leaf scope so the verdict names exactly this
+    // escrow — a settle for one entry can never claim a sibling that should
+    // cancel. An unregistered escrow has no scope here and recovers on-chain via
+    // the deadline refund (no charge).
+    let Some(entry_scope) = state::entry_scope(&auction_id, &lot_id, &escrow) else {
+        return AuctionResult::EntryNotFound;
+    };
+    // Claim the scope *before* the await: the store only lands after it, so
+    // without this N concurrent requests for one entry would each miss the store
+    // and each pay. A losing sibling is free — it retries and finds the stored
+    // signature.
+    if !signing::claim(entry_scope) {
+        return AuctionResult::SignInFlight;
+    }
+    // Payment accepted only now, before the (paid) threshold signature.
+    ic_cdk::api::msg_cycles_accept(config::SIGN_PRICE);
+    let arg = SignWithSchnorrArgs {
+        message: protocol::verdict_message(config::DOMAIN, &config::FACTORY, outcome),
+        derivation_path: vec![entry_scope.to_vec()],
+        key_id: SchnorrKeyId {
+            algorithm: SchnorrAlgorithm::Ed25519,
+            name: config::THRESHOLD_KEY.to_string(),
+        },
+        aux: None,
+    };
+    match sign_with_schnorr(&arg).await {
+        Ok(res) => {
+            signing::store(entry_scope, outcome, res.signature.clone());
+            AuctionResult::Signed {
+                outcome,
+                signature: res.signature,
             }
-            // Payment accepted only now, before the (paid) threshold signature.
-            ic_cdk::api::msg_cycles_accept(config::SIGN_PRICE);
-            let arg = SignWithSchnorrArgs {
-                message: protocol::verdict_message(config::DOMAIN, &config::FACTORY, outcome),
-                derivation_path: vec![entry_scope.to_vec()],
-                key_id: SchnorrKeyId {
-                    algorithm: SchnorrAlgorithm::Ed25519,
-                    name: config::THRESHOLD_KEY.to_string(),
-                },
-                aux: None,
-            };
-            match sign_with_schnorr(&arg).await {
-                Ok(res) => {
-                    signing::store(entry_scope, outcome, res.signature.clone());
-                    AuctionResult::Signed {
-                        outcome,
-                        signature: res.signature,
-                    }
-                }
-                Err(_) => {
-                    signing::release(&entry_scope); // keep the entry retriable
-                    AuctionResult::SignFailed
-                }
-            }
+        }
+        Err(_) => {
+            signing::release(&entry_scope); // keep the entry retriable
+            AuctionResult::SignFailed
         }
     }
 }
@@ -573,11 +526,12 @@ fn get_auction(auction: String) -> Option<AuctionStateView> {
 #[ic_cdk::query]
 fn get_lot(auction: String, lot: String) -> Option<LotView> {
     let (id, lot_id) = (field::hex32(&auction)?, field::hex32(&lot)?);
-    let (accepted, returned, live_entries, text_hash) = state::lot_view(&id, &lot_id)?;
+    let (accepted, returned, live_entries, total, text_hash) = state::lot_view(&id, &lot_id)?;
     Some(LotView {
         accepted,
         returned,
         live_entries,
+        total,
         text_hash: hex::encode(text_hash),
     })
 }
@@ -588,8 +542,6 @@ fn auction_id_of(
     recipient: [u8; 32],
     recipient_nonce: u64,
     duration: u64,
-    perform_window: u64,
-    voting_period: u64,
     min_entry: u64,
 ) -> [u8; 32] {
     let canister = ic_cdk::api::canister_self();
@@ -598,21 +550,20 @@ fn auction_id_of(
         recipient,
         recipient_nonce,
         duration,
-        perform_window,
-        voting_period,
         min_entry,
     )
 }
 
-/// A lot-scoped recipient action (`accept` / `return_lot` / `pick`): admit it
-/// (signature + target + ids + signer is the recipient) at the boundary-shared
+/// A lot-scoped recipient action (`accept` / `return_lot`): admit it (signature +
+/// target + ids + signer is the recipient) at the boundary-shared
 /// `admit_lot_action`, then run `op` for the state transition.
 fn lot_action(
     text: &str,
     action_name: &str,
-    op: impl FnOnce(&[u8; 32], &[u8; 32], &[u8; 32], u64) -> Result<State, state::StateError>,
+    target: fn([u8; 32]) -> state::Target,
+    op: impl FnOnce(&[u8; 32], &[u8; 32], &[u8; 32], u64) -> Result<state::View, state::StateError>,
 ) -> AuctionResult {
-    let (auction_id, signer, lot_id) = match admit_lot_action(text, action_name) {
+    let (auction_id, signer, lot_id) = match admit_lot_action(text, action_name, target) {
         Ok(x) => x,
         Err(e) => return e,
     };
@@ -622,13 +573,13 @@ fn lot_action(
     }
 }
 
-/// An auction-scoped recipient action (`ready` / `cancel`): admit it (signature +
-/// target + auction id + signer is the recipient) at the boundary-shared
+/// An auction-scoped recipient action (`cancel`): admit it (signature + target +
+/// auction id + signer is the recipient) at the boundary-shared
 /// `admit_auction_action`, then run `op` for the state transition.
 fn auction_action(
     text: &str,
     action_name: &str,
-    op: impl FnOnce(&[u8; 32], &[u8; 32], u64) -> Result<State, state::StateError>,
+    op: impl FnOnce(&[u8; 32], &[u8; 32], u64) -> Result<state::View, state::StateError>,
 ) -> AuctionResult {
     let (auction_id, signer) = match admit_auction_action(text, action_name) {
         Ok(x) => x,
@@ -640,74 +591,16 @@ fn auction_action(
     }
 }
 
-/// The voter's weight = their reputation to the auction's recipient, proven by
-/// the book witness against an already-authenticated index root. `None` if the
-/// proof is invalid or the auction is unknown.
-///
-/// Like the birth proof, this is a pure hash-tree walk against the `ROOTS` cache
-/// (`push_root` did the BLS, paid). The certificate must not be verified here:
-/// `admit_vote` runs at the boundary, and two pairings per anonymous vote would
-/// blow the 200M-instruction `inspect_message` budget — a *valid* vote could not
-/// be admitted at all (spec §Методы, `cost.md §6` #2).
-fn voter_weight(req: &request::Request, auction_id: &[u8; 32], voter: &[u8; 32]) -> Option<u128> {
-    let recipient = state::recipient(auction_id)?;
-    let weight_witness = field::hex_bytes(req.extra("weight_witness"))?;
-    let chain = crown_games_common::chain_id(config::CHAIN_ID);
-    ROOTS.with_borrow(|cache| roots::reputation(cache, &weight_witness, &chain, voter, &recipient))
-}
-
 // ---- Boundary admissibility (harness §6) ----
 //
 // Each state-changing method has an `admit_*` that proves it would pass — the cheap
 // validity prefix (signature + target + ids + signer-is-recipient), plus, for
-// `register_entry`, the expensive blind birth proof, and for `vote`, the weight
-// proof. The boundary (`inspect_message`) runs it to drop doomed/spam work before
-// the replicated `update`; the `update` calls the same `admit_*` so the check is
-// authoritative and never duplicated. Every `admit_*` is time-free (never
-// `now_secs`), so it is safe to run in `inspect_message`; the time/state-dependent
-// tail (materialize, deadline policy, state transition) stays in the update body.
-
-/// Admit a `create`: signature + target + the recomputed `auction_id` matches the
-/// signed `auction`. Returns the derived id; the update just echoes it.
-fn admit_create(text: &str) -> Result<[u8; 32], AuctionResult> {
-    let Some(req) = request::parse(text) else {
-        return Err(AuctionResult::Malformed);
-    };
-    if req.signed("action") != Some("create") || !target_ok(&req) {
-        return Err(AuctionResult::WrongTarget);
-    }
-    let recipient = req.pubkey;
-    let (
-        Some(auction_claimed),
-        Some(duration),
-        Some(perform_window),
-        Some(voting_period),
-        Some(min_entry),
-        Some(recipient_nonce),
-    ) = (
-        req.signed("auction").and_then(field::hex32),
-        field::u64_of(req.signed("duration")),
-        field::u64_of(req.signed("perform_window")),
-        field::u64_of(req.signed("voting_period")),
-        field::u64_of(req.signed("min_entry")),
-        field::u64_of(req.extra("recipient_nonce")),
-    )
-    else {
-        return Err(AuctionResult::Malformed);
-    };
-    let id = auction_id_of(
-        recipient,
-        recipient_nonce,
-        duration,
-        perform_window,
-        voting_period,
-        min_entry,
-    );
-    if id != auction_claimed {
-        return Err(AuctionResult::AuctionIdMismatch);
-    }
-    Ok(id)
-}
+// `register_entry`, the blind birth proof. The boundary (`inspect_message`) runs it
+// to drop doomed/spam work before the replicated `update`; the `update` calls the
+// same `admit_*` so the check is authoritative and never duplicated. Every
+// `admit_*` is time-free (never `now_secs`), so it is safe to run in
+// `inspect_message`; the time/state-dependent tail (materialize, deadline policy,
+// state transition) stays in the update body.
 
 /// A `register_entry` that passed every proof/field check — the data the update
 /// needs for the time/state-dependent tail (materialize + per-entry gate + add).
@@ -717,8 +610,6 @@ struct Registered {
     recipient: [u8; 32],
     min_entry: u64,
     duration: u64,
-    perform_window: u64,
-    voting_period: u64,
     gross: u64,
     deadline: i64,
     text_hash: [u8; 32],
@@ -750,22 +641,12 @@ fn admit_register_entry(text: &str) -> Result<Registered, AuctionResult> {
     ) else {
         return Err(AuctionResult::Malformed);
     };
-    let (
-        Some(recipient),
-        Some(recipient_nonce),
-        Some(duration),
-        Some(perform_window),
-        Some(voting_period),
-        Some(min_entry),
-    ) = (
+    let (Some(recipient), Some(recipient_nonce), Some(duration), Some(min_entry)) = (
         req.extra("recipient").and_then(bs58_array::<32>),
         field::u64_of(req.extra("recipient_nonce")),
         field::u64_of(req.extra("duration")),
-        field::u64_of(req.extra("perform_window")),
-        field::u64_of(req.extra("voting_period")),
         field::u64_of(req.extra("min_entry")),
-    )
-    else {
+    ) else {
         return Err(AuctionResult::Malformed);
     };
     // Only the witness is needed: the root it reconstructs against was
@@ -780,14 +661,7 @@ fn admit_register_entry(text: &str) -> Result<Registered, AuctionResult> {
     };
 
     // Recompute auction_id from the presented fields; the signed `auction` pins it.
-    let auction_id = auction_id_of(
-        recipient,
-        recipient_nonce,
-        duration,
-        perform_window,
-        voting_period,
-        min_entry,
-    );
+    let auction_id = auction_id_of(recipient, recipient_nonce, duration, min_entry);
     if auction_id != auction_claimed {
         return Err(AuctionResult::AuctionIdMismatch);
     }
@@ -796,6 +670,14 @@ fn admit_register_entry(text: &str) -> Result<Registered, AuctionResult> {
     // then verify the birth proof there. The resolver lives at the entry, so the
     // verdict signed under it names exactly this escrow — never a sibling.
     let lot_id = protocol::lot_id(&auction_id, &text_hash);
+    // Cheapest decisive check first (`cost.md §6` #2): `lot_id` is one sha256, and
+    // knowing the auction is closed or the lot returned settles the request before
+    // the resolver derivation, the PDA bump search and the witness walk are paid
+    // for. Every one of those refusals is replayable forever otherwise — the
+    // signed half of a request carries no nonce.
+    if let Err(e) = state::register_admits(&auction_id, &lot_id) {
+        return Err(state_error(e));
+    }
     let entry_id = protocol::entry_id(&lot_id, &donor, nonce, gross, deadline);
     let Some(entry_resolver) = resolver::resolver(&master_pk, &chain_code, &entry_id) else {
         return Err(AuctionResult::Malformed);
@@ -840,8 +722,6 @@ fn admit_register_entry(text: &str) -> Result<Registered, AuctionResult> {
         recipient,
         min_entry,
         duration,
-        perform_window,
-        voting_period,
         gross,
         deadline,
         text_hash,
@@ -857,29 +737,22 @@ type LotAdmit = ([u8; 32], [u8; 32], [u8; 32]);
 /// The admitted identifiers of a return-entry: `(auction_id, signer, lot_id, escrow)`.
 type EntryAdmit = ([u8; 32], [u8; 32], [u8; 32], [u8; 32]);
 
-/// Admit a lot-scoped recipient action (`accept` / `return_lot` / `pick`):
-/// signature + target + ids + the signer is the auction's recipient. Returns
+/// Admit a lot-scoped recipient action (`accept` / `return_lot`): signature +
+/// target + ids + the signer is the auction's recipient. Returns
 /// `(auction_id, signer, lot_id)`; the state op is authoritative on the transition.
 /// An unknown auction is `NotFound`, a non-recipient signer is `NotRecipient` —
 /// the same variants the state op used to produce.
-/// The signed `action` field ↔ the machine's action kind, in **one** place. Both
-/// the boundary and the update reach the state check through here, so they cannot
-/// disagree about which kind a method is — a mismatch would either admit a doomed
-/// call or drop a valid one, and both are silent. `None` is unreachable from the
-/// fixed call sites and is treated as a wrong target rather than a panic.
-fn kind_of(action_name: &str) -> Option<ActionKind> {
-    Some(match action_name {
-        "accept" => ActionKind::AcceptLot,
-        "return_lot" => ActionKind::ReturnLot,
-        "pick" => ActionKind::PickWinner,
-        "cancel" => ActionKind::CancelAuction,
-        "ready" => ActionKind::Ready,
-        "return_entry" => ActionKind::ReturnEntry,
-        _ => return None,
-    })
-}
-
-fn admit_lot_action(text: &str, action_name: &str) -> Result<LotAdmit, AuctionResult> {
+///
+/// The action name is not mapped to a machine action kind, and does not need to
+/// be: every recipient action lives in `Bidding` and none survives the close, so
+/// `action_admits` is decided by the state alone. What the name still does is
+/// separate the signed messages — one signature is never redeemable as another
+/// action (`protocol::messages_are_byte_exact`).
+fn admit_lot_action(
+    text: &str,
+    action_name: &str,
+    target: fn([u8; 32]) -> state::Target,
+) -> Result<LotAdmit, AuctionResult> {
     let Some(req) = request::parse(text) else {
         return Err(AuctionResult::Malformed);
     };
@@ -892,17 +765,14 @@ fn admit_lot_action(text: &str, action_name: &str) -> Result<LotAdmit, AuctionRe
     ) else {
         return Err(AuctionResult::Malformed);
     };
-    let Some(kind) = kind_of(action_name) else {
-        return Err(AuctionResult::WrongTarget);
-    };
-    match state::action_admits(&auction_id, &req.pubkey, kind) {
+    match state::recipient_admits(&auction_id, &req.pubkey, target(lot_id)) {
         Ok(()) => Ok((auction_id, req.pubkey, lot_id)),
         Err(e) => Err(state_error(e)),
     }
 }
 
-/// Admit an auction-scoped recipient action (`ready` / `cancel`): signature +
-/// target + auction id + the signer is the recipient. Returns `(auction_id, signer)`.
+/// Admit an auction-scoped recipient action (`cancel`): signature + target +
+/// auction id + the signer is the recipient. Returns `(auction_id, signer)`.
 fn admit_auction_action(
     text: &str,
     action_name: &str,
@@ -916,10 +786,7 @@ fn admit_auction_action(
     let Some(auction_id) = req.signed("auction").and_then(field::hex32) else {
         return Err(AuctionResult::Malformed);
     };
-    let Some(kind) = kind_of(action_name) else {
-        return Err(AuctionResult::WrongTarget);
-    };
-    match state::action_admits(&auction_id, &req.pubkey, kind) {
+    match state::recipient_admits(&auction_id, &req.pubkey, state::Target::Auction) {
         Ok(()) => Ok((auction_id, req.pubkey)),
         Err(e) => Err(state_error(e)),
     }
@@ -942,52 +809,14 @@ fn admit_return_entry(text: &str) -> Result<EntryAdmit, AuctionResult> {
     ) else {
         return Err(AuctionResult::Malformed);
     };
-    match state::action_admits(&auction_id, &req.pubkey, ActionKind::ReturnEntry) {
+    match state::recipient_admits(
+        &auction_id,
+        &req.pubkey,
+        state::Target::EntryToReturn(lot_id, escrow),
+    ) {
         Ok(()) => Ok((auction_id, req.pubkey, lot_id, escrow)),
         Err(e) => Err(state_error(e)),
     }
-}
-
-/// Admit a `vote`: signature + target + a weight proof meeting `MIN_VOTE_WEIGHT`.
-/// The `lot` is still decoded (a malformed lot fails the message) then discarded —
-/// votes attach to the auction's winner lot, dedup is by voter. Returns
-/// `(auction_id, vote)`; `state::add_vote` applies the dedup + `V_MAX` cap.
-fn admit_vote(text: &str) -> Result<([u8; 32], Vote), AuctionResult> {
-    let Some(req) = request::parse(text) else {
-        return Err(AuctionResult::Malformed);
-    };
-    if req.signed("action") != Some("vote") || !target_ok(&req) {
-        return Err(AuctionResult::WrongTarget);
-    }
-    let (Some(auction_id), Some(lot_id), Some(done)) = (
-        req.signed("auction").and_then(field::hex32),
-        req.signed("lot").and_then(field::hex32),
-        req.signed("choice").and_then(field::choice),
-    ) else {
-        return Err(AuctionResult::Malformed);
-    };
-    let _ = lot_id; // votes attach to the auction (winner lot); dedup is by voter
-                    // Cheap committed-state gate *before* the weight proof (harness §6): a doomed
-                    // vote (unknown / over cap / duplicate voter / not `Voting`) is dropped here —
-                    // at the boundary and without a BLS pairing — so a replay can't force the
-                    // pairing on the replicated path. `add_vote` re-checks authoritatively.
-    if let Err(e) = state::vote_admits(&auction_id, &req.pubkey, V_MAX) {
-        return Err(state_error(e));
-    }
-    let Some(weight) = voter_weight(&req, &auction_id, &req.pubkey) else {
-        return Err(AuctionResult::BadBirthProof);
-    };
-    if weight < MIN_VOTE_WEIGHT {
-        return Err(AuctionResult::WeightBelowThreshold);
-    }
-    Ok((
-        auction_id,
-        Vote {
-            voter: req.pubkey,
-            weight,
-            done,
-        },
-    ))
 }
 
 /// The boundary dispatch: admit a state-changing ingress iff its `admit_*` check
@@ -996,17 +825,11 @@ fn admit_vote(text: &str) -> Result<([u8; 32], Vote), AuctionResult> {
 /// falls through to `_ => false` and is dropped.
 fn admissible(method: &str, text: &str) -> bool {
     match method {
-        // `get_auction_id` is a `query` (`P7.15`) — queries reached as queries are
-        // never inspected, and reached as replicated updates they would be, which
-        // is exactly the anonymous free-work path this list must not open.
         "register_entry" => admit_register_entry(text).is_ok(),
-        "accept_lot" => admit_lot_action(text, "accept").is_ok(),
-        "return_lot" => admit_lot_action(text, "return_lot").is_ok(),
-        "pick_winner" => admit_lot_action(text, "pick").is_ok(),
+        "accept_lot" => admit_lot_action(text, "accept", state::Target::LotToAccept).is_ok(),
+        "return_lot" => admit_lot_action(text, "return_lot", state::Target::LotToReturn).is_ok(),
         "return_entry" => admit_return_entry(text).is_ok(),
         "cancel_auction" => admit_auction_action(text, "cancel").is_ok(),
-        "ready" => admit_auction_action(text, "ready").is_ok(),
-        "vote" => admit_vote(text).is_ok(),
         _ => false,
     }
 }
@@ -1020,18 +843,14 @@ fn now_secs() -> u64 {
     ic_cdk::api::time() / 1_000_000_000
 }
 
-fn state_view(s: &State) -> AuctionStateView {
-    match s {
-        State::Bidding => AuctionStateView::Bidding,
-        State::Performing => AuctionStateView::Performing,
-        State::Voting { .. } => AuctionStateView::Voting,
-        State::Done {
-            winner: Some(Outcome::Settle),
-        } => AuctionStateView::DoneSettle,
-        State::Done {
-            winner: Some(Outcome::Cancel),
-        } => AuctionStateView::DoneCancel,
-        State::Done { winner: None } => AuctionStateView::DoneNoWinner,
+fn state_view(v: &state::View) -> AuctionStateView {
+    match v.state {
+        State::Bidding => AuctionStateView::Bidding {
+            closes_at: v.closes_at,
+        },
+        State::Done { winner_lot } => AuctionStateView::Done {
+            winner_lot: winner_lot.map(hex::encode),
+        },
     }
 }
 
@@ -1040,8 +859,6 @@ fn reg_error(e: validate::RegError) -> AuctionResult {
     match e {
         E::GrossBelowMinEntry => AuctionResult::GrossBelowMinEntry,
         E::DurationOutOfRange => AuctionResult::DurationOutOfRange,
-        E::PerformWindowOutOfRange => AuctionResult::PerformWindowOutOfRange,
-        E::VotingPeriodOutOfRange => AuctionResult::VotingPeriodOutOfRange,
         E::DeadlineTooTight => AuctionResult::DeadlineTooTight,
         E::TimeOverflow => AuctionResult::TimeOverflow,
     }
@@ -1057,14 +874,11 @@ fn state_error(e: state::StateError) -> AuctionResult {
         E::LotNotFound => AuctionResult::LotNotFound,
         E::LotReturned => AuctionResult::LotReturned,
         E::LotAlreadyAccepted => AuctionResult::LotAlreadyAccepted,
-        E::LotNotAccepted => AuctionResult::LotNotAccepted,
         E::EntryNotFound => AuctionResult::EntryNotFound,
         E::EntryReturned => AuctionResult::EntryReturned,
         E::DuplicateEscrow => AuctionResult::DuplicateEscrow,
-        E::VoteCapReached => AuctionResult::VoteCapReached,
+        E::TotalOverflow => AuctionResult::TotalOverflow,
         E::Step(Se::InvalidTransition) => AuctionResult::InvalidTransition,
-        E::Step(Se::WeightBelowThreshold) => AuctionResult::WeightBelowThreshold,
-        E::Step(Se::DuplicateVoter) => AuctionResult::DuplicateVoter,
         E::Step(Se::Overflow) => AuctionResult::StepOverflow,
     }
 }

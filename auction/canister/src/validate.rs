@@ -1,9 +1,9 @@
 //! Registration validation (auction spec §Таблица переходов `register_entry`,
 //! §Правило дедлайна, §get_auction_id footnote¹). Per-entry gates (`gross ≥
 //! min_entry`, the deadline margin) apply on every `register_entry`; the rule-
-//! snapshot range checks (`duration`/`perform_window`/`voting_period` ∈
-//! `[MIN_DURATION, MAX_DURATION]`) apply once, at materialization. Pure, ordered,
-//! `checked` — an unrepresentable instant is `TimeOverflow`, not a panic.
+//! snapshot range check (`duration ∈ [MIN_DURATION, MAX_DURATION]`) applies once,
+//! at materialization. Pure, ordered, `checked` — an unrepresentable instant is
+//! `TimeOverflow`, not a panic.
 
 use auction_logic::{min_deadline, MAX_DURATION, MIN_DURATION};
 
@@ -12,8 +12,6 @@ use auction_logic::{min_deadline, MAX_DURATION, MIN_DURATION};
 pub enum RegError {
     GrossBelowMinEntry,
     DurationOutOfRange,
-    PerformWindowOutOfRange,
-    VotingPeriodOutOfRange,
     DeadlineTooTight,
     TimeOverflow,
 }
@@ -40,35 +38,22 @@ pub fn validate_entry(
     deadline: i64,
     created_at: u64,
     duration: u64,
-    perform_window: u64,
-    voting_period: u64,
 ) -> Result<(), RegError> {
     if gross < floor {
         return Err(RegError::GrossBelowMinEntry);
     }
-    match min_deadline(created_at, duration, perform_window, voting_period) {
+    match min_deadline(created_at, duration) {
         None => Err(RegError::TimeOverflow),
         Some(min) if deadline < min => Err(RegError::DeadlineTooTight),
         Some(_) => Ok(()),
     }
 }
 
-/// Materialization gate (first confirmed entry): the rule snapshot ranges
-/// (spec §get_auction_id footnote¹). Checked in a fixed order.
-pub fn validate_ranges(
-    duration: u64,
-    perform_window: u64,
-    voting_period: u64,
-) -> Result<(), RegError> {
-    let range = MIN_DURATION..=MAX_DURATION;
-    if !range.contains(&duration) {
+/// Materialization gate (first confirmed entry): the rule snapshot range
+/// (spec §get_auction_id footnote¹).
+pub fn validate_ranges(duration: u64) -> Result<(), RegError> {
+    if !(MIN_DURATION..=MAX_DURATION).contains(&duration) {
         return Err(RegError::DurationOutOfRange);
-    }
-    if !range.contains(&perform_window) {
-        return Err(RegError::PerformWindowOutOfRange);
-    }
-    if !range.contains(&voting_period) {
-        return Err(RegError::VotingPeriodOutOfRange);
     }
     Ok(())
 }
@@ -80,25 +65,20 @@ mod tests {
 
     const CREATED: u64 = 1_000;
     const DUR: u64 = 600;
-    const PW: u64 = 300;
-    const VP: u64 = 120;
 
     fn tight() -> i64 {
-        // created + dur + pw + vp + margin
-        i64::try_from(CREATED + DUR + PW + VP + DEADLINE_MARGIN).unwrap()
+        // created + dur + margin
+        i64::try_from(CREATED + DUR + DEADLINE_MARGIN).unwrap()
     }
 
     #[test]
     fn gross_below_min_entry_is_rejected_first() {
         assert_eq!(
-            validate_entry(99, 100, tight(), CREATED, DUR, PW, VP),
+            validate_entry(99, 100, tight(), CREATED, DUR),
             Err(RegError::GrossBelowMinEntry)
         );
         // At/above min_entry with a tight deadline → ok.
-        assert_eq!(
-            validate_entry(100, 100, tight(), CREATED, DUR, PW, VP),
-            Ok(())
-        );
+        assert_eq!(validate_entry(100, 100, tight(), CREATED, DUR), Ok(()));
     }
 
     #[test]
@@ -111,47 +91,40 @@ mod tests {
         assert_eq!(entry_floor(5_000, 1_000), 5_000);
         // And the gate enforces exactly that floor.
         assert_eq!(
-            validate_entry(500, entry_floor(0, 1_000), tight(), CREATED, DUR, PW, VP),
+            validate_entry(500, entry_floor(0, 1_000), tight(), CREATED, DUR),
             Err(RegError::GrossBelowMinEntry)
         );
         assert_eq!(
-            validate_entry(1_000, entry_floor(0, 1_000), tight(), CREATED, DUR, PW, VP),
+            validate_entry(1_000, entry_floor(0, 1_000), tight(), CREATED, DUR),
             Ok(())
         );
     }
 
     #[test]
     fn deadline_boundary_is_inclusive_and_overflow_is_reported() {
-        assert_eq!(validate_entry(0, 0, tight(), CREATED, DUR, PW, VP), Ok(()));
+        assert_eq!(validate_entry(0, 0, tight(), CREATED, DUR), Ok(()));
         assert_eq!(
-            validate_entry(0, 0, tight() - 1, CREATED, DUR, PW, VP),
+            validate_entry(0, 0, tight() - 1, CREATED, DUR),
             Err(RegError::DeadlineTooTight)
         );
         assert_eq!(
-            validate_entry(0, 0, i64::MAX, u64::MAX, 1, 0, 0),
+            validate_entry(0, 0, i64::MAX, u64::MAX, 1),
             Err(RegError::TimeOverflow)
         );
     }
 
     #[test]
-    fn ranges_checked_in_order() {
-        assert_eq!(validate_ranges(DUR, PW, VP), Ok(()));
+    fn duration_range_is_inclusive() {
+        assert_eq!(validate_ranges(DUR), Ok(()));
         assert_eq!(
-            validate_ranges(MIN_DURATION - 1, PW, VP),
+            validate_ranges(MIN_DURATION - 1),
             Err(RegError::DurationOutOfRange)
         );
         assert_eq!(
-            validate_ranges(DUR, MAX_DURATION + 1, VP),
-            Err(RegError::PerformWindowOutOfRange)
+            validate_ranges(MAX_DURATION + 1),
+            Err(RegError::DurationOutOfRange)
         );
-        assert_eq!(
-            validate_ranges(DUR, PW, MIN_DURATION - 1),
-            Err(RegError::VotingPeriodOutOfRange)
-        );
-        // Bounds inclusive.
-        assert_eq!(
-            validate_ranges(MIN_DURATION, MAX_DURATION, MIN_DURATION),
-            Ok(())
-        );
+        assert_eq!(validate_ranges(MIN_DURATION), Ok(()));
+        assert_eq!(validate_ranges(MAX_DURATION), Ok(()));
     }
 }
