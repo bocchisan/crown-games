@@ -1,0 +1,153 @@
+name: ci
+
+on: [push, pull_request]
+
+# Один workflow на весь реп, а не по одному в каждой игре. GitHub Actions читает
+# **только** `.github/workflows/` в корне репозитория, а `crown-games` — один реп
+# с играми в подкаталогах; четыре файла `<game>/.github/workflows/ci.yml` не
+# запускались вовсе, то есть ни линты границ, ни тесты, ни сверка `.did` трёх игр
+# и общего крейта не гонялись ни на одном пуше. Пер-игровые различия сохранены в
+# комментариях шагов, общее вынесено в матрицу.
+
+jobs:
+  # Общий крейт (`repo-map §2`): своей CI у него нет, потому что он не реп, — но
+  # в нём живёт вся деликатная крипта игр (пруф рождения, кеш корней, резолвер,
+  # разбор запроса), поэтому проверяется он здесь, а не «по дороге» матрицей:
+  # `--all-targets` линтит члены воркспейса, а `common` играм — path-зависимость.
+  common:
+    runs-on: ubuntu-latest
+    steps:
+      # Именованные каталоги: репы обязаны лечь **рядом**, как в дереве
+      # разработчика — `crown-games-common` тянет `crown-derive`/`crown-salt`
+      # по `path = "../../crown-factory/…"`, и без соседа не разрешается манифест.
+      - uses: actions/checkout@v4
+        with:
+          path: crown-games
+      - uses: actions/checkout@v4
+        with:
+          repository: bocchisan/crown-factory
+          path: crown-factory
+
+      - name: fmt
+        working-directory: crown-games/common
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        working-directory: crown-games/common
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        working-directory: crown-games/common
+        run: cargo test
+
+  games:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        game: [conditional-tasks, conditional-funding, auction]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: crown-games
+
+      # `crown-derive`/`crown-salt` — адрес эскроу тем же счётом, что у индекса.
+      - uses: actions/checkout@v4
+        with:
+          repository: bocchisan/crown-factory
+          path: crown-factory
+
+      # `full_e2e` поднимает **настоящий** индекс в реплике и доказывает против
+      # его сертификата, поэтому реп индекса нужен целиком: тест сам собирает его
+      # wasm (`wasm(INDEX_WASM, "../../../crown-indexer", &["--lib"])`).
+      - uses: actions/checkout@v4
+        with:
+          repository: bocchisan/crown-indexer
+          path: crown-indexer
+
+      # Индексу, в свою очередь, нужен закон книги — иначе его манифест не
+      # разрешится и `full_e2e` упадёт на сборке чужого wasm.
+      - uses: actions/checkout@v4
+        with:
+          repository: bocchisan/crown-reduce
+          path: crown-reduce
+
+      # e2e игр гоняют настоящую IC-реплику и без сервера падают, а не
+      # пропускаются. Версия обязана совпадать с крейтом `pocket-ic` (13.0.0).
+      - name: pocket-ic server
+        run: |
+          curl -fsSL https://github.com/dfinity/pocketic/releases/download/13.0.0/pocket-ic-x86_64-linux.gz \
+            | gunzip > "$RUNNER_TEMP/pocket-ic"
+          chmod +x "$RUNNER_TEMP/pocket-ic"
+          "$RUNNER_TEMP/pocket-ic" --version
+          echo "POCKET_IC_BIN=$RUNNER_TEMP/pocket-ic" >> "$GITHUB_ENV"
+
+      # Игровой и индексный wasm собирают сами тесты — цель нужна заранее.
+      - name: wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: fmt
+        working-directory: crown-games/${{ matrix.game }}
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        working-directory: crown-games/${{ matrix.game }}
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        working-directory: crown-games/${{ matrix.game }}
+        run: cargo test
+
+      # Border (games-harness §2): игра не ходит наружу — ни SOL RPC, ни звонка
+      # в индекс (вес/рождение — пруфом, локально; у аукциона финал тоже пруф
+      # рождения, а не `getAccountInfo`).
+      - name: no outbound (no SOL RPC / http outcall)
+        working-directory: crown-games/${{ matrix.game }}
+        run: |
+          ! grep -rnE 'http_request|SolRpc|sol_rpc|management_canister::.*http' canister/src
+
+      # Border (games-harness §6 / spec §Методы): BLS-пары сертификата живут
+      # **только** на платном `push_root`. На анонимной границе
+      # (`inspect_message`, 200M инструкций) они не помещаются — валидная
+      # регистрация/голос не прошли бы вовсе. Каждый per-caller пруф — обход
+      # хеш-дерева против кеша `ROOTS`.
+      - name: BLS only on the paid push_root
+        working-directory: crown-games/${{ matrix.game }}
+        run: |
+          test "$(grep -c 'birth::certified_root' canister/src/lib.rs)" = "1"
+          grep -A 12 'fn push_root' canister/src/lib.rs | grep -q 'birth::certified_root'
+
+      # Border (games-harness §3): без таймеров/поллинга (у аукциона финал —
+      # pull-пагинация, а не будильник).
+      - name: no timers
+        working-directory: crown-games/${{ matrix.game }}
+        run: |
+          ! grep -rnE 'set_timer|canister_global_timer|ic_cdk_timers' canister/src
+
+      # `.did` обязан совпадать с тем, что реально экспортирует wasm: список
+      # update-методов игры — это её граница (`CLAUDE.md`: «список фиксирован
+      # спекой, это эталон, против которого сверяется `.did`»), а сверяемый
+      # руками файл разъезжается молча. Так и было: у `conditional-funding`
+      # порядок вариантов разошёлся с извлечённым и никто этого не видел.
+      - name: .did matches the wasm
+        working-directory: crown-games/${{ matrix.game }}
+        run: |
+          cargo install candid-extractor --locked
+          crate="$(echo '${{ matrix.game }}' | tr '-' '_')"
+          cargo build --lib --release --target wasm32-unknown-unknown
+          candid-extractor "target/wasm32-unknown-unknown/release/$crate.wasm" > /tmp/gen.did
+          diff -u '${{ matrix.game }}.did' /tmp/gen.did
+
+  # `subscription` — использование формы `stream` БЕЗ канистры и резолвера: в
+  # каталоге только `docs/` и офчейн-`e2e/`, поэтому у него нет ни fmt/clippy/test
+  # игры, ни `.did`. Проверяется ровно то, что делает его тем, чем он является.
+  subscription:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: crown-games
+      - name: form-usage only (no canister, no resolver)
+        working-directory: crown-games/subscription
+        run: |
+          ! grep -rnwE 'ic_cdk|sign_with_schnorr|resolver' --include='*.rs' . 2>/dev/null

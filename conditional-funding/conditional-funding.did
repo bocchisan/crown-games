@@ -2,7 +2,6 @@
 type CollectionResult = variant {
   Advanced : CollectionStateView;
   Underpaid;
-  GrossBelowFloor;
   DurationOutOfRange;
   // A `create` without a birth proof: derivation echo only, zero writes.
   Derived : record { resolver : text; collection : text };
@@ -24,6 +23,7 @@ type CollectionResult = variant {
   // A sibling call is already signing this scope — free, no charge. Retry and
   // the produced signature is served from store.
   SignInFlight;
+  GrossBelowFloor;
   SignFailed;
   DuplicateVoter;
   // A verdict signature: `outcome` (settle=0/refund=1) + the schnorr signature.
