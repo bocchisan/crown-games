@@ -3,11 +3,19 @@
 use crate::machine::{Outcome, Vote};
 use crate::APPROVAL_THRESHOLD_SCALE;
 
-/// `settle` ⇔ turnout `>= quorum_weight` **and** `yes·10000 > approval_threshold
-/// ·turnout` (strict). A tie, an undershoot of quorum, an empty vote, or any
-/// counting overflow → `refund` (a collection always finalizes). The quorum is
-/// an absolute weight over **both** sides (`yes+no`), not a fraction of the
-/// funded total — the canister is blind to how much was raised.
+/// `refund` ⇔ turnout `>= quorum_weight` **and** `yes·10000 < approval_threshold
+/// ·turnout` (strict). Everything else settles: a tie, an undershoot of quorum,
+/// an empty vote (a collection always finalizes). Silence pays the recipient —
+/// refusing the payout takes a quorate vote that actually comes out against it.
+///
+/// The quorum therefore no longer guards the donor; it only gates whether the
+/// approval share is consulted at all. It stays an absolute weight over **both**
+/// sides (`yes+no`), not a fraction of the funded total — the canister is blind
+/// to how much was raised.
+///
+/// A counting overflow is the one exception and still `refund`: it is a failure
+/// of the tally, not a verdict of the voters, and settling on it would let
+/// crafted weights force a payout.
 pub fn verdict(votes: &[Vote], quorum_weight: u128, approval_threshold: u16) -> Outcome {
     let mut yes: u128 = 0;
     let mut no: u128 = 0;
@@ -23,9 +31,9 @@ pub fn verdict(votes: &[Vote], quorum_weight: u128, approval_threshold: u16) -> 
         None => return Outcome::Refund,
     };
     if turnout < quorum_weight {
-        return Outcome::Refund;
+        return Outcome::Settle;
     }
-    // Strict: yes·10000 > approval_threshold·turnout.
+    // Non-strict: settle unless yes·10000 falls short of approval_threshold·turnout.
     let share = match yes.checked_mul(u128::from(APPROVAL_THRESHOLD_SCALE)) {
         Some(s) => s,
         None => return Outcome::Refund,
@@ -34,7 +42,7 @@ pub fn verdict(votes: &[Vote], quorum_weight: u128, approval_threshold: u16) -> 
         Some(b) => b,
         None => return Outcome::Refund,
     };
-    if share > bar {
+    if share >= bar {
         Outcome::Settle
     } else {
         Outcome::Refund
@@ -48,7 +56,7 @@ mod tests {
     use proptest::prelude::*;
 
     const Q: u128 = 150_000; // quorum
-    const T: u16 = 5_000; // strict majority
+    const T: u16 = 5_000; // half — a tie clears it
 
     fn vote(weight: u128, done: bool) -> Vote {
         Vote {
@@ -59,29 +67,33 @@ mod tests {
     }
 
     #[test]
-    fn empty_is_refund() {
-        assert_eq!(verdict(&[], Q, T), Outcome::Refund);
+    fn empty_settles() {
+        // No voters at all → the recipient is paid; silence is not a veto.
+        assert_eq!(verdict(&[], Q, T), Outcome::Settle);
     }
 
     #[test]
-    fn undershooting_quorum_is_refund() {
-        // A landslide yes, but turnout below quorum → refund.
-        assert_eq!(verdict(&[vote(Q - 1, true)], Q, T), Outcome::Refund);
-        // Exactly at quorum with all-yes → settle.
-        assert_eq!(verdict(&[vote(Q, true)], Q, T), Outcome::Settle);
+    fn undershooting_quorum_settles() {
+        // A landslide yes below quorum → settle.
+        assert_eq!(verdict(&[vote(Q - 1, true)], Q, T), Outcome::Settle);
+        // And so does an all-no vote below quorum: an inquorate "no" cannot stop
+        // the payout — this is the branch that used to protect the donor.
+        assert_eq!(verdict(&[vote(Q - 1, false)], Q, T), Outcome::Settle);
+        // One unit of weight more and the same all-no vote is quorate → refund.
+        assert_eq!(verdict(&[vote(Q, false)], Q, T), Outcome::Refund);
     }
 
     #[test]
-    fn tie_is_refund_strict_majority_settles() {
-        // 50/50 at quorum → tie → refund (strict >).
+    fn tie_settles_and_a_quorate_no_majority_refunds() {
+        // 50/50 at quorum → tie → settle (non-strict ≥).
         assert_eq!(
             verdict(&[vote(Q, true), vote(Q, false)], Q, T),
-            Outcome::Refund
-        );
-        // One unit over half → settle.
-        assert_eq!(
-            verdict(&[vote(Q + 1, true), vote(Q, false)], Q, T),
             Outcome::Settle
+        );
+        // One unit over half on the "no" side → refund.
+        assert_eq!(
+            verdict(&[vote(Q, true), vote(Q + 1, false)], Q, T),
+            Outcome::Refund
         );
     }
 
@@ -116,8 +128,8 @@ mod tests {
             verdict(&[vote(u128::MAX, true), vote(1, false)], Q, T),
             Outcome::Refund
         );
-        // share = yes·10000 overflow (quorum 0 → we pass the turnout gate and reach
-        // the multiply).
+        // share = yes·10000 overflow (quorum 0 → nothing is below it, so we pass the
+        // turnout gate and reach the multiply).
         assert_eq!(verdict(&[vote(u128::MAX, true)], 0, T), Outcome::Refund);
         // bar = approval_threshold·turnout overflow (all-no → share = 0 is fine, so
         // the refund comes from the bar multiply, not an earlier branch).
@@ -125,8 +137,8 @@ mod tests {
     }
 
     proptest! {
-        /// With bounded weights (no overflow), settle iff turnout ≥ quorum and
-        /// `yes·10000 > threshold·turnout`.
+        /// With bounded weights (no overflow), refund iff turnout ≥ quorum and
+        /// `yes·10000 < threshold·turnout`; everything else settles.
         #[test]
         fn matches_the_rule(
             yes_w in prop::collection::vec(1u128..1_000_000, 0..30),
@@ -141,11 +153,11 @@ mod tests {
             let no: u128 = no_w.iter().sum();
             let turnout = yes + no;
             let expected = if turnout >= quorum
-                && yes * 10_000 > u128::from(threshold) * turnout
+                && yes * 10_000 < u128::from(threshold) * turnout
             {
-                Outcome::Settle
-            } else {
                 Outcome::Refund
+            } else {
+                Outcome::Settle
             };
             prop_assert_eq!(verdict(&votes, quorum, threshold), expected);
         }

@@ -1,11 +1,21 @@
-//! Full canister-game e2e — Part A (PocketIC): the birth-proof / signing path that
+//! Full canister-game e2e (PocketIC): the birth-proof / voting / signing path that
 //! needs a real index + threshold key, without a live Solana RPC outcall.
 //!
-//! Milestone 1 (this file, for now): a mock SOL RPC canister at the index's pinned
-//! `SOL_RPC` principal returns a synthetic `create_escrow` transaction, so a paid
-//! `ingest` (fronted by the relay proxy with cycles) folds it into a **birth** —
-//! proving the index's recognition path end-to-end on a replica. Later milestones
-//! extend this to `register_task` → `request_signature` → a real `Signed` verdict.
+//! A mock SOL RPC canister at the index's pinned `SOL_RPC` principal serves
+//! synthetic-but-real-shaped transactions, so a paid `ingest` (fronted by the relay
+//! proxy with cycles) folds them into a **birth** and into **reputation**. From
+//! there the three tests below cover, in order:
+//!
+//!   1. the index's recognition path alone — `create_escrow` → birth;
+//!   2. `register_task` → `decline` → `request_signature` → `Signed{Cancel}`;
+//!   3. `accept` → `ready` → a weighted `vote` → the window closes →
+//!      `Signed{Settle}`, and the same flow voted the other way → `Signed{Cancel}`.
+//!
+//! Every terminal outcome the game can reach is produced here on a replica, and
+//! every signature is verified against the task's resolver — the same check the
+//! two-outcome `claim` makes on chain. What is still out of reach: the money
+//! movement itself (that is `two-outcome/tests/claim.rs` and the live `T5`) and
+//! the multi-provider RPC consensus, which does not exist off IC mainnet.
 //!
 //!   POCKET_IC_BIN=~/.cache/dfinity/versions/<v>/pocket-ic cargo test --test full_e2e
 
@@ -29,13 +39,19 @@ const VOTING_PERIOD: u64 = 120; // config::VOTING_PERIOD (testnet profile)
 const FEE_BPS: u16 = 300;
 const FEE_WALLET_B58: &str = "FS6ZNuPxXqWSGzwXEQpfoxikDksbEzmrXGZDFXmFj6vS";
 const SEP: &str = "\n---\n";
+/// `conditional_tasks_logic::DEADLINE_MARGIN` (72 h). The logic crate is a
+/// dependency of the canister, not of this test binary, so the value is copied
+/// like `VOTING_PERIOD` above — it is what turns a `deadline` into a `voting_end`.
+const DEADLINE_MARGIN: i64 = 259_200;
+/// `conditional_tasks_logic::MIN_VOTE_WEIGHT` — a lighter vote never counts.
+const MIN_VOTE_WEIGHT: u128 = 100_000;
+
+fn b58_32(s: &str) -> [u8; 32] {
+    bs58::decode(s).into_vec().unwrap().try_into().unwrap()
+}
 
 fn fee_wallet() -> [u8; 32] {
-    bs58::decode(FEE_WALLET_B58)
-        .into_vec()
-        .unwrap()
-        .try_into()
-        .unwrap()
+    b58_32(FEE_WALLET_B58)
 }
 
 /// Build the conditional-tasks wasm into an isolated target dir — not to select a
@@ -211,11 +227,75 @@ fn anon() -> Principal {
 }
 
 fn factory() -> [u8; 32] {
-    bs58::decode(TWO_OUTCOME_FACTORY)
-        .into_vec()
-        .unwrap()
-        .try_into()
-        .unwrap()
+    b58_32(TWO_OUTCOME_FACTORY)
+}
+
+// ---- Reputation: what a vote actually weighs ----
+//
+// A vote weighs the voter's book reputation to the task's recipient, and the only
+// way into the book is an honest settlement read from chain (`00 §9`). The index
+// recognizes one when a `Settled` event-CPI of the **pinned splitter** is
+// cross-checked by a real `TransferChecked` in the same transaction — same mint,
+// amount and authority (`crown-indexer/src/recognize.rs`). The recognition roots
+// below are copies of the index's devnet profile, for the same reason
+// `TWO_OUTCOME_FACTORY` is: the test must not link the index canister.
+
+/// `splitter` of `crown-indexer/config/testnet.toml`.
+const SPLITTER: &str = "DKs2C9dRJSnZsERdD58cUVXMracvVTDS19PWvUz98GrN";
+/// `usdc` of the same profile — the mint the cross-check demands.
+const USDC: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+/// SPL Token program id (`Tokenkeg…`) — a Solana constant, not a config value.
+const TOKEN_PROGRAM: [u8; 32] = [
+    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237,
+    95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+];
+/// SPL Token `TransferChecked` tag (data byte 0).
+const TRANSFER_CHECKED_TAG: u8 = 12;
+/// Anchor's `emit_cpi!` self-CPI tag: the first 8 bytes of an event-CPI's data.
+const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
+
+/// Anchor discriminator `sha256("event:Settled")[0..8]`.
+fn settled_disc() -> [u8; 8] {
+    let mut h = Sha256::new();
+    h.update(b"event:Settled");
+    let d = h.finalize();
+    let mut o = [0u8; 8];
+    o.copy_from_slice(&d[0..8]);
+    o
+}
+
+/// A direct donation as the chain shows it: the splitter's `Settled` event-CPI
+/// plus the `TransferChecked` that backs it. The index folds it into `gross` of
+/// reputation for `donor` at `recipient` — which is the weight a vote carries.
+/// Returned base58-encoded, as the SOL RPC would.
+fn settlement_tx(donor: Pubkey, recipient: [u8; 32], gross: u64) -> String {
+    let mut transfer = vec![TRANSFER_CHECKED_TAG];
+    transfer.extend_from_slice(&gross.to_le_bytes());
+    transfer.push(6); // decimals (USDC)
+    let transfer_ix = Instruction {
+        program_id: Pubkey::new_from_array(TOKEN_PROGRAM),
+        // `[source, mint, destination, authority]`; the cross-check reads 1 and 3.
+        accounts: vec![
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(b58_32(USDC)), false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(donor, true),
+        ],
+        data: transfer,
+    };
+    let mut event = EVENT_IX_TAG.to_vec();
+    event.extend_from_slice(&settled_disc());
+    event.extend_from_slice(&donor.to_bytes());
+    event.extend_from_slice(&recipient);
+    event.extend_from_slice(&gross.to_le_bytes());
+    let settled_ix = Instruction {
+        program_id: Pubkey::new_from_array(b58_32(SPLITTER)),
+        accounts: vec![],
+        data: event,
+    };
+    let msg = Message::new(&[transfer_ix, settled_ix], Some(&donor));
+    let tx = Transaction::new_unsigned(msg);
+    bs58::encode(bincode::serialize(&tx).unwrap()).into_string()
 }
 
 /// Anchor discriminator: `sha256("global:create_escrow")[0..8]` — matches what the
@@ -303,6 +383,53 @@ fn setup() -> (PocketIc, Principal, Principal, Principal) {
     );
 
     (pic, index, mock, proxy)
+}
+
+/// Relay `method` to `target` with `cycles` attached, returning the raw reply.
+/// Ingress carries no cycles, so every paid call goes through the proxy fixture.
+fn relay(
+    pic: &PocketIc,
+    proxy: Principal,
+    target: Principal,
+    method: &str,
+    inner: Vec<u8>,
+    cycles: u128,
+) -> Vec<u8> {
+    let arg = Encode!(&target, &method.to_string(), &inner, &cycles).unwrap();
+    let reply = pic
+        .update_call(proxy, anon(), "relay", arg)
+        .unwrap_or_else(|e| panic!("relay {method}: {e:?}"));
+    let raw = Decode!(&reply, Vec<u8>).expect("proxy returns raw reply bytes");
+    assert!(!raw.is_empty(), "the {method} call itself was rejected");
+    raw
+}
+
+/// Arm the mock with the next `getTransaction` reply and fold it with one paid
+/// ingest, returning what the index recognized.
+fn ingest(
+    pic: &PocketIc,
+    mock: Principal,
+    proxy: Principal,
+    index: Principal,
+    reply: MultiGetTransactionResult,
+    sig: &str,
+) -> IngestResult {
+    pic.update_call(
+        mock,
+        anon(),
+        "set_reply",
+        Encode!(&Encode!(&reply).unwrap()).unwrap(),
+    )
+    .expect("set_reply");
+    let raw = relay(
+        pic,
+        proxy,
+        index,
+        "ingest",
+        Encode!(&sig.to_string()).unwrap(),
+        INGEST_PRICE,
+    );
+    Decode!(&raw, IngestResult).unwrap()
 }
 
 #[test]
@@ -641,4 +768,416 @@ fn register_decline_and_sign_a_real_verdict() {
     let sig = ed25519_dalek::Signature::from_slice(&signature).expect("64-byte signature");
     vk.verify_strict(&verdict, &sig)
         .expect("the threshold verdict signature verifies against the resolver");
+}
+
+/// Milestone 5: the branch the game exists for — work accepted and **paid**.
+/// `accept` → `ready` → a reputation-weighted `vote` → the window closes → a real
+/// threshold `Signed{Settle}`, verified against the task's resolver. With the
+/// `Cancel` half above, both terminal outcomes are now produced on a replica, and
+/// `accept`/`ready`/`vote` are executed as endpoints rather than as `state::`
+/// calls — until this test none of the three had ever run inside a canister.
+///
+/// **Two tasks, and that is the point.** With the verdict default flipped in the
+/// recipient's favour (`LOGIC_VERSION` 5: silence and a tie settle), a lone settle
+/// case is vacuously green — it passes with the ballot uncounted, or with `choice`
+/// never read, because doing nothing settles too. The second task is voted
+/// `not_done` by the same voter with the same weight and must come out `Cancel`.
+/// Only the pair can go red in its own case (`P7.13`).
+///
+/// The vote's weight is not asserted into existence either: it is real book
+/// reputation, folded by the index from a `Settled` the splitter emitted, and the
+/// witness is whatever `get_reputation` hands out.
+#[test]
+fn a_weighted_vote_decides_both_verdicts_and_signs_them() {
+    let game_bytes = tasks_game_wasm();
+    let (pic, index, mock, proxy) = setup();
+
+    let root_key = pic.root_key().expect("nns root key");
+    let app = pic.topology().get_app_subnets()[0];
+    let tasks = pic.create_canister_on_subnet(None, None, app);
+    pic.add_cycles(tasks, 40_000_000_000_000);
+    let init = Some(InitArgs {
+        nns_root_key: root_key,
+        index,
+    });
+    pic.install_canister(tasks, game_bytes, Encode!(&init).unwrap(), None);
+    let b = pic
+        .update_call(tasks, anon(), "bootstrap", Encode!().unwrap())
+        .expect("bootstrap");
+    assert!(matches!(
+        Decode!(&b, TaskResult).unwrap(),
+        TaskResult::KeyBootstrapped
+    ));
+    // `bootstrap` is admitted only while the master key is missing (spec §Граница).
+    // The very same call that just succeeded is now dropped at the boundary — for
+    // free, before any replicated execution — so a one-shot setup method cannot be
+    // turned into an unbounded free `update` by replaying it.
+    assert!(
+        pic.update_call(tasks, anon(), "bootstrap", Encode!().unwrap())
+            .is_err(),
+        "a repeat bootstrap must be dropped once the key is taken"
+    );
+
+    let donor = SigningKey::from_bytes(&[9u8; 32]);
+    let donor_pk = donor.verifying_key().to_bytes();
+    let recipient_sk = SigningKey::from_bytes(&[5u8; 32]);
+    let recipient = recipient_sk.verifying_key().to_bytes();
+    // A third wallet: it holds reputation *at this recipient* and never touches an
+    // escrow. Weight is local to the recipient (`00 §10.1`), so this is the only
+    // thing that gives the ballot any weight at all.
+    let voter_sk = SigningKey::from_bytes(&[3u8; 32]);
+    let voter = voter_sk.verifying_key().to_bytes();
+
+    let gross = 2_000_000u64;
+    let duration = 100_000u64;
+    // The escrow `deadline` is the game's only clock (§Тайминги): both `cutoff` and
+    // `voting_end` are read off it. Set to the minimum the registration rule allows
+    // plus an hour of slack, so the whole window is short enough to step over
+    // inside one test — the cancel path above never has to reach `voting_end` and
+    // uses a year-2096 deadline instead.
+    let now_secs = (pic.get_time().as_nanos_since_unix_epoch() / 1_000_000_000) as i64;
+    let deadline = now_secs + duration as i64 + VOTING_PERIOD as i64 + DEADLINE_MARGIN + 3_600;
+    let voting_end = deadline - DEADLINE_MARGIN;
+
+    // The two tasks differ **only** in `nonce` and in how the voter votes: same
+    // donor, recipient, gross and deadline. So the verdicts can only diverge on
+    // the ballot.
+    let cases: [(u64, &str, u8, &str); 2] = [
+        (1, "done", 0, "sig-settle-birth"),
+        (2, "not_done", 1, "sig-cancel-birth"),
+    ];
+
+    // ---- derive both tasks and fold both births ----
+    let mut derived = Vec::new();
+    for (nonce, choice, outcome, birth_sig) in cases {
+        let task_id = protocol::task_id(
+            tasks.as_slice(),
+            donor_pk,
+            recipient,
+            gross,
+            deadline,
+            FEE_BPS,
+            fee_wallet(),
+            nonce,
+            duration,
+            VOTING_PERIOD,
+        );
+        let task_bs58 = bs58::encode(task_id).into_string();
+
+        let rq = pic
+            .query_call(tasks, anon(), "get_resolver", Encode!(&task_bs58).unwrap())
+            .expect("get_resolver");
+        let resolver: [u8; 32] =
+            bs58::decode(Decode!(&rq, Option<String>).unwrap().expect("resolver"))
+                .into_vec()
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        let salt = crown_salt::two_outcome::two_outcome(
+            donor_pk,
+            recipient,
+            gross,
+            deadline,
+            resolver,
+            FEE_BPS,
+            fee_wallet(),
+            nonce,
+        );
+        let (escrow_arr, _) =
+            crown_derive::solana_pda_address(factory(), &[b"escrow", &salt]).unwrap();
+
+        let r = ingest(
+            &pic,
+            mock,
+            proxy,
+            index,
+            consistent_reply(
+                birth_tx(
+                    Pubkey::new_from_array(donor_pk),
+                    Pubkey::new_from_array(escrow_arr),
+                    salt,
+                ),
+                600 + nonce,
+            ),
+            birth_sig,
+        );
+        assert!(
+            matches!(r, IngestResult::Applied { births: 1, .. }),
+            "task {nonce}: the birth must fold: {r:?}"
+        );
+
+        derived.push((nonce, choice, outcome, task_bs58, resolver, escrow_arr));
+    }
+
+    // ---- the voter buys its weight: one real settlement, folded by the index ----
+    // The only way into the book (`00 §9`, harness §1). Above the index's dust
+    // floor ($0.20) and above `MIN_VOTE_WEIGHT`, or the ballot would not be
+    // admitted at all.
+    let weight_gross = 500_000u64;
+    let r = ingest(
+        &pic,
+        mock,
+        proxy,
+        index,
+        consistent_reply(
+            settlement_tx(Pubkey::new_from_array(voter), recipient, weight_gross),
+            700,
+        ),
+        "sig-voter-weight",
+    );
+    assert!(
+        matches!(
+            r,
+            IngestResult::Applied {
+                settlements: 1,
+                anomalies: 0,
+                ..
+            }
+        ),
+        "the voter's donation must fold into reputation: {r:?}"
+    );
+
+    let chain = conditional_tasks::field::chain_id("devnet");
+    let repq = pic
+        .query_call(
+            index,
+            anon(),
+            "get_reputation",
+            Encode!(&chain.to_vec(), &voter.to_vec(), &recipient.to_vec()).unwrap(),
+        )
+        .expect("get_reputation");
+    let (weight, weight_witness) = Decode!(&repq, candid::Nat, Vec<u8>).unwrap();
+    assert_eq!(
+        weight,
+        candid::Nat::from(weight_gross),
+        "the book credits the voter at this recipient"
+    );
+    assert!(
+        u128::from(weight_gross) >= MIN_VOTE_WEIGHT,
+        "the seeded weight must clear the vote threshold, or nothing below is reachable"
+    );
+    assert!(
+        !weight_witness.is_empty(),
+        "a reputation witness is returned"
+    );
+
+    // ---- one paid root refresh covers every proof above ----
+    let cq = pic
+        .query_call(index, anon(), "get_certificate", Encode!().unwrap())
+        .expect("get_certificate");
+    let cert = Decode!(&cq, Option<Vec<u8>>, Vec<u8>)
+        .unwrap()
+        .0
+        .expect("certificate present");
+    let pr = relay(
+        &pic,
+        proxy,
+        tasks,
+        "push_root",
+        Encode!(&cert).unwrap(),
+        1_000_000_000u128,
+    );
+    assert!(
+        matches!(Decode!(&pr, TaskResult).unwrap(), TaskResult::RootPushed),
+        "the index certificate authenticates a root"
+    );
+
+    // ---- register → accept → ready → vote, both tasks, direct ingress ----
+    let text_hash = [0xabu8; 32];
+    for (nonce, choice, _outcome, task_bs58, _resolver, escrow_arr) in &derived {
+        let bq = pic
+            .query_call(
+                index,
+                anon(),
+                "get_birth",
+                Encode!(&escrow_arr.to_vec()).unwrap(),
+            )
+            .expect("get_birth");
+        let witness = Decode!(&bq, Option<BirthView>, Vec<u8>).unwrap().1;
+
+        let msg = protocol::register_message(
+            "devnet",
+            &tasks.to_text(),
+            task_bs58,
+            &hex::encode(text_hash),
+            duration,
+        );
+        let extras = vec![
+            ("recipient", bs58::encode(recipient).into_string()),
+            ("gross", gross.to_string()),
+            ("deadline", deadline.to_string()),
+            ("nonce", nonce.to_string()),
+            ("witness", hex::encode(&witness)),
+        ];
+        let rr = pic
+            .update_call(
+                tasks,
+                anon(),
+                "register_task",
+                Encode!(&signed_request(&donor, &msg, &extras)).unwrap(),
+            )
+            .expect("register must be admitted");
+        assert!(
+            matches!(Decode!(&rr, TaskResult).unwrap(), TaskResult::Materialized),
+            "task {nonce}: register must materialize"
+        );
+
+        // The recipient takes the task (the text becomes public) and declares it
+        // done. Both are wallet-signed ingress the boundary admits by state.
+        let accept_text = signed_request(
+            &recipient_sk,
+            &protocol::accept_message("devnet", &tasks.to_text(), task_bs58),
+            &[],
+        );
+
+        // Size is cut **first**, before anything is parsed (`MAX_ARG_BYTES` = 8 KiB).
+        // Padded with an unsigned extra the parser would otherwise ignore, so this
+        // request is valid in every other respect — the *only* reason it dies is its
+        // length, and the unpadded twin below proves it by being admitted.
+        let padded = format!("{accept_text}\npadding: {}", "x".repeat(9_000));
+        assert!(
+            padded.len() > 8 * 1024,
+            "the padded request has to actually exceed the cap"
+        );
+        assert!(
+            pic.update_call(tasks, anon(), "accept", Encode!(&padded).unwrap())
+                .is_err(),
+            "task {nonce}: an oversized ingress must be dropped before it is parsed"
+        );
+
+        let ar = pic
+            .update_call(tasks, anon(), "accept", Encode!(&accept_text).unwrap())
+            .expect("accept admitted");
+        assert!(
+            matches!(
+                Decode!(&ar, TaskResult).unwrap(),
+                TaskResult::Advanced(TaskStateView::Accepted)
+            ),
+            "task {nonce}: accept must reveal the text"
+        );
+
+        // Byte-identical replay of a now-doomed action. The signed half carries no
+        // nonce, so one observed valid message is a flood template; the boundary
+        // refuses it by **state**, not just by signer, and the canister is never
+        // billed for the round (`cost.md §6` #2).
+        assert!(
+            pic.update_call(tasks, anon(), "accept", Encode!(&accept_text).unwrap())
+                .is_err(),
+            "task {nonce}: a second accept is doomed and must die at the boundary"
+        );
+        let rdy = pic
+            .update_call(
+                tasks,
+                anon(),
+                "ready",
+                Encode!(&signed_request(
+                    &recipient_sk,
+                    &protocol::ready_message("devnet", &tasks.to_text(), task_bs58),
+                    &[]
+                ))
+                .unwrap(),
+            )
+            .expect("ready admitted");
+        assert!(
+            matches!(
+                Decode!(&rdy, TaskResult).unwrap(),
+                TaskResult::Advanced(TaskStateView::Voting)
+            ),
+            "task {nonce}: ready must open the voting window"
+        );
+
+        // The ballot. Its weight is proven, not asserted: a hash-tree walk over
+        // the reputation witness against the root pushed above — the same path
+        // `inspect_message` ran to admit this very call.
+        let vr = pic
+            .update_call(
+                tasks,
+                anon(),
+                "vote",
+                Encode!(&signed_request(
+                    &voter_sk,
+                    &protocol::vote_message("devnet", &tasks.to_text(), task_bs58, choice),
+                    &[("weight_witness", hex::encode(&weight_witness))]
+                ))
+                .unwrap(),
+            )
+            .unwrap_or_else(|e| {
+                panic!("task {nonce}: a weight-proven vote must be admitted: {e:?}")
+            });
+        assert!(
+            matches!(
+                Decode!(&vr, TaskResult).unwrap(),
+                TaskResult::Advanced(TaskStateView::Voting)
+            ),
+            "task {nonce}: the vote is recorded and the window stays open"
+        );
+    }
+
+    // Still undecided while the window is open — no verdict to sign yet.
+    for (nonce, _, _, task_bs58, _, _) in &derived {
+        let v = pic
+            .query_call(tasks, anon(), "get_verdict", Encode!(task_bs58).unwrap())
+            .expect("get_verdict");
+        assert!(
+            Decode!(&v, Option<TaskStateView>).unwrap().is_none(),
+            "task {nonce}: no verdict before the window closes"
+        );
+    }
+
+    // ---- the window closes on its own: no timer, a pure function of `deadline` ----
+    pic.advance_time(std::time::Duration::from_secs(
+        (voting_end - now_secs + 1) as u64,
+    ));
+    pic.tick();
+
+    for (nonce, choice, outcome, task_bs58, resolver, _) in &derived {
+        let v = pic
+            .query_call(tasks, anon(), "get_verdict", Encode!(task_bs58).unwrap())
+            .expect("get_verdict");
+        let got = Decode!(&v, Option<TaskStateView>)
+            .unwrap()
+            .expect("the tally is lazy but total — reading past the window decides");
+        let decided_as_expected = matches!(
+            (*outcome, got),
+            (0, TaskStateView::DecidedSettle) | (1, TaskStateView::DecidedCancel)
+        );
+        assert!(
+            decided_as_expected,
+            "task {nonce}: a single `{choice}` vote must decide outcome {outcome}, got {got:?}"
+        );
+
+        // Paid pull → a real threshold Ed25519 signature over this task's verdict.
+        let sr = relay(
+            &pic,
+            proxy,
+            tasks,
+            "request_signature",
+            Encode!(&"devnet".to_string(), task_bs58).unwrap(),
+            26_200_000_000u128,
+        );
+        let signature = match Decode!(&sr, TaskResult).unwrap() {
+            TaskResult::Signed {
+                outcome: got_outcome,
+                signature,
+            } => {
+                assert_eq!(got_outcome, *outcome, "task {nonce}: signed outcome");
+                assert_eq!(signature.len(), 64, "a 64-byte Ed25519 signature");
+                signature
+            }
+            other => panic!("task {nonce}: expected Signed, got {other:?}"),
+        };
+
+        // What Solana's ed25519 program (and `two-outcome`'s `assert_resolver_signed`)
+        // checks: the verdict message under this task's resolver. Verifying it here
+        // proves `claim(settle)` on chain would accept these bytes.
+        let mut verdict = b"crown:two-outcome:devnet".to_vec();
+        verdict.extend_from_slice(&factory());
+        verdict.push(*outcome);
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(resolver)
+            .expect("resolver is a valid Ed25519 public key");
+        let sig = ed25519_dalek::Signature::from_slice(&signature).expect("64-byte signature");
+        vk.verify_strict(&verdict, &sig)
+            .unwrap_or_else(|e| panic!("task {nonce}: the verdict signature must verify: {e:?}"));
+    }
 }

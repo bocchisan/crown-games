@@ -21,7 +21,7 @@ pub use machine::{step, Action, Collection, Outcome, State, StepError, Vote};
 pub use verdict::verdict;
 
 /// Version of the rules.
-pub const LOGIC_VERSION: u32 = 3;
+pub const LOGIC_VERSION: u32 = 4;
 
 /// Minimum vote weight (reputation minor units).
 pub const MIN_VOTE_WEIGHT: u128 = 100_000;

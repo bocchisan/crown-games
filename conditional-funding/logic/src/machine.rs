@@ -331,14 +331,15 @@ mod tests {
     }
 
     #[test]
-    fn silence_refunds() {
-        // Voting window closes with no votes → refund (quorum undershoot).
+    fn silence_settles() {
+        // Voting window closes with no votes → settle. An inquorate vote no longer
+        // protects the donor; stopping the payout takes a quorate "no".
         let mut c = collection(State::Voting { started_at: 0 }, vec![]);
         assert_eq!(step(&mut c, Action::Tick, VP), Ok(()));
         assert_eq!(
             c.state,
             State::Decided {
-                outcome: Outcome::Refund
+                outcome: Outcome::Settle
             }
         );
     }

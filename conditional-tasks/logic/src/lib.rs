@@ -20,7 +20,7 @@ pub use verdict::verdict;
 
 /// Version of the rules — bumped only by a deliberate change to the machine or
 /// verdict rule.
-pub const LOGIC_VERSION: u32 = 4;
+pub const LOGIC_VERSION: u32 = 5;
 
 /// Minimum vote weight (reputation minor units); a lighter vote never counts.
 pub const MIN_VOTE_WEIGHT: u128 = 100_000;

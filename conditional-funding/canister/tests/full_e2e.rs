@@ -256,6 +256,73 @@ fn birth_tx(donor: Pubkey, escrow: Pubkey, salt: [u8; 32]) -> String {
     bs58::encode(bincode::serialize(&tx).unwrap()).into_string()
 }
 
+// ---- Reputation: what a vote actually weighs ----
+//
+// A vote weighs the voter's book reputation to the collection's recipient, and the
+// only way into the book is an honest settlement read from chain (`00 §9`). The
+// index recognizes one when a `Settled` event-CPI of the **pinned splitter** is
+// cross-checked by a real `TransferChecked` in the same transaction — same mint,
+// amount and authority (`crown-indexer/src/recognize.rs`). The recognition roots
+// below are copies of the index's devnet profile, for the same reason
+// `TWO_OUTCOME_FACTORY` is: the test must not link the index canister.
+
+/// `splitter` of `crown-indexer/config/testnet.toml`.
+const SPLITTER: &str = "DKs2C9dRJSnZsERdD58cUVXMracvVTDS19PWvUz98GrN";
+/// `usdc` of the same profile — the mint the cross-check demands.
+const USDC: &str = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+/// SPL Token program id (`Tokenkeg…`) — a Solana constant, not a config value.
+const TOKEN_PROGRAM: [u8; 32] = [
+    6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121, 172, 28, 180, 133, 237,
+    95, 91, 55, 145, 58, 140, 245, 133, 126, 255, 0, 169,
+];
+/// SPL Token `TransferChecked` tag (data byte 0).
+const TRANSFER_CHECKED_TAG: u8 = 12;
+/// Anchor's `emit_cpi!` self-CPI tag: the first 8 bytes of an event-CPI's data.
+const EVENT_IX_TAG: [u8; 8] = [0xe4, 0x45, 0xa5, 0x2e, 0x51, 0xcb, 0x9a, 0x1d];
+
+/// Anchor discriminator `sha256("event:Settled")[0..8]`.
+fn settled_disc() -> [u8; 8] {
+    let mut h = Sha256::new();
+    h.update(b"event:Settled");
+    let d = h.finalize();
+    let mut o = [0u8; 8];
+    o.copy_from_slice(&d[0..8]);
+    o
+}
+
+/// A direct donation as the chain shows it: the splitter's `Settled` event-CPI
+/// plus the `TransferChecked` that backs it. The index folds it into `gross` of
+/// reputation for `donor` at `recipient` — which is the weight a vote carries.
+fn settlement_tx(donor: Pubkey, recipient: [u8; 32], gross: u64) -> String {
+    let mut transfer = vec![TRANSFER_CHECKED_TAG];
+    transfer.extend_from_slice(&gross.to_le_bytes());
+    transfer.push(6); // decimals (USDC)
+    let transfer_ix = Instruction {
+        program_id: Pubkey::new_from_array(TOKEN_PROGRAM),
+        // `[source, mint, destination, authority]`; the cross-check reads 1 and 3.
+        accounts: vec![
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(b58_32(USDC)), false),
+            AccountMeta::new(Pubkey::new_unique(), false),
+            AccountMeta::new_readonly(donor, true),
+        ],
+        data: transfer,
+    };
+    let mut event = EVENT_IX_TAG.to_vec();
+    event.extend_from_slice(&settled_disc());
+    event.extend_from_slice(&donor.to_bytes());
+    event.extend_from_slice(&recipient);
+    event.extend_from_slice(&gross.to_le_bytes());
+    let settled_ix = Instruction {
+        program_id: Pubkey::new_from_array(b58_32(SPLITTER)),
+        accounts: vec![],
+        data: event,
+    };
+    let msg = Message::new(&[transfer_ix, settled_ix], Some(&donor));
+    let tx = Transaction::new_unsigned(msg);
+    bs58::encode(bincode::serialize(&tx).unwrap()).into_string()
+}
+
 fn consistent_reply(tx_b58: String, slot: u64) -> MultiGetTransactionResult {
     MultiGetTransactionResult::Consistent(GetTransactionResult::Ok(Some(TransactionReply {
         slot,
@@ -326,7 +393,37 @@ fn relay(
     let reply = pic
         .update_call(proxy, anon(), "relay", arg)
         .unwrap_or_else(|e| panic!("relay {method}: {e:?}"));
-    Decode!(&reply, Vec<u8>).expect("proxy returns raw reply bytes")
+    let raw = Decode!(&reply, Vec<u8>).expect("proxy returns raw reply bytes");
+    assert!(!raw.is_empty(), "the {method} call itself was rejected");
+    raw
+}
+
+/// Arm the mock with the next `getTransaction` reply and fold it with one paid
+/// ingest, returning what the index recognized.
+fn ingest(
+    pic: &PocketIc,
+    mock: Principal,
+    proxy: Principal,
+    index: Principal,
+    reply: MultiGetTransactionResult,
+    sig: &str,
+) -> IngestResult {
+    pic.update_call(
+        mock,
+        anon(),
+        "set_reply",
+        Encode!(&Encode!(&reply).unwrap()).unwrap(),
+    )
+    .expect("set_reply");
+    let raw = relay(
+        pic,
+        proxy,
+        index,
+        "ingest",
+        Encode!(&sig.to_string()).unwrap(),
+        INGEST_PRICE,
+    );
+    Decode!(&raw, IngestResult).unwrap()
 }
 
 /// The whole IC-side flow, ending in a real threshold Ed25519 verdict signature
@@ -639,4 +736,394 @@ fn create_cancel_and_sign_a_real_verdict() {
         .expect("signature is stored");
     assert_eq!(view.outcome, 1);
     assert_eq!(view.signature, signature);
+}
+
+/// The path a collection is actually decided by — `ready` → a quorate,
+/// reputation-weighted `vote` → the window closes → a real threshold signature.
+/// `recipient_cancel` above is the shortcut; this is the vote.
+///
+/// **Two collections, and that is the point.** With the verdict default flipped in
+/// the recipient's favour (`LOGIC_VERSION` 4: silence, a tie and an inquorate vote
+/// all settle), a lone settle case is vacuously green — it passes with the ballot
+/// uncounted, because doing nothing settles too. The second collection is voted
+/// `not_done` by the same voter with the same weight and must come out `Refund`.
+/// Only the pair can go red in its own case (`P7.13`), and only the pair shows the
+/// quorum gate and the approval share doing their two different jobs.
+///
+/// Until this test, `ready` and `vote` were only ever exercised by the live devnet
+/// driver (`e2e/f5`), which needs money and does not run in CI.
+#[test]
+fn a_quorate_vote_decides_a_collection_both_ways() {
+    let game_bytes = game_wasm();
+    let (pic, index, mock, proxy) = setup();
+
+    let root_key = pic.root_key().expect("nns root key");
+    let app = pic.topology().get_app_subnets()[0];
+    let game = pic.create_canister_on_subnet(None, None, app);
+    pic.add_cycles(game, 40_000_000_000_000);
+    let init = Some(InitArgs {
+        nns_root_key: root_key,
+        index,
+    });
+    pic.install_canister(game, game_bytes, Encode!(&init).unwrap(), None);
+    let b = pic
+        .update_call(game, anon(), "bootstrap", Encode!().unwrap())
+        .expect("bootstrap");
+    assert!(matches!(
+        Decode!(&b, CollectionResult).unwrap(),
+        CollectionResult::KeyBootstrapped
+    ));
+    // `bootstrap` is admitted only while the master key is missing (spec §Граница).
+    // The very same call that just succeeded is now dropped at the boundary — for
+    // free, before any replicated execution — so a one-shot setup method cannot be
+    // turned into an unbounded free `update` by replaying it.
+    assert!(
+        pic.update_call(game, anon(), "bootstrap", Encode!().unwrap())
+            .is_err(),
+        "a repeat bootstrap must be dropped once the key is taken"
+    );
+
+    let recipient_sk = SigningKey::from_bytes(&[5u8; 32]);
+    let recipient = recipient_sk.verifying_key().to_bytes();
+    let donor_sk = SigningKey::from_bytes(&[9u8; 32]);
+    let donor = donor_sk.verifying_key().to_bytes();
+    // A third wallet: it holds reputation *at this recipient* and contributes
+    // nothing. Weight is local to the recipient (`00 §10.1`).
+    let voter_sk = SigningKey::from_bytes(&[3u8; 32]);
+    let voter = voter_sk.verifying_key().to_bytes();
+
+    let duration = 100_000u64;
+    let goal = 5_000_000u128;
+    let gross = 2_000_000u64;
+    let deadline = 4_000_000_000i64; // far future; the vote window is the clock here
+
+    // Same pinning as the cancel path above: the collection's window anchors on the
+    // birth **slot**, so the replica clock is set relative to the config anchor.
+    pic.set_time(Time::from_nanos_since_unix_epoch(
+        (GENESIS_UNIX + 3_600) * 1_000_000_000,
+    ));
+    let now_secs = pic.get_time().as_nanos_since_unix_epoch() / 1_000_000_000;
+    let created_at = now_secs - 60;
+    let slot = GENESIS_SLOT + (created_at - GENESIS_UNIX) * 1_000 / SLOT_MS;
+
+    // The two collections differ **only** in `recipient_nonce` (which just spreads
+    // the id) and in how the voter votes. Same recipient, contribution and window.
+    let cases: [(u64, u64, &str, u8, &str); 2] = [
+        (1, 7, "done", 0, "sig-cf-settle"),
+        (2, 8, "not_done", 1, "sig-cf-refund"),
+    ];
+
+    let mut derived = Vec::new();
+    for (recipient_nonce, nonce, choice, outcome, birth_sig) in cases {
+        let collection_id = protocol::collection_id(
+            game.as_slice(),
+            recipient,
+            recipient_nonce,
+            duration,
+            VOTING_PERIOD,
+            APPROVAL_THRESHOLD,
+            QUORUM_WEIGHT,
+        );
+        let collection_hex = hex::encode(collection_id);
+
+        let rq = pic
+            .query_call(
+                game,
+                anon(),
+                "get_resolver",
+                Encode!(&collection_hex).unwrap(),
+            )
+            .expect("get_resolver");
+        let resolver: [u8; 32] =
+            bs58::decode(Decode!(&rq, Option<String>).unwrap().expect("resolver"))
+                .into_vec()
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+        let salt = crown_salt::two_outcome::two_outcome(
+            donor,
+            recipient,
+            gross,
+            deadline,
+            resolver,
+            FEE_BPS,
+            fee_wallet(),
+            nonce,
+        );
+        let (escrow_arr, _) =
+            crown_derive::solana_pda_address(factory(), &[b"escrow", &salt]).unwrap();
+
+        let r = ingest(
+            &pic,
+            mock,
+            proxy,
+            index,
+            consistent_reply(
+                birth_tx(
+                    Pubkey::new_from_array(donor),
+                    Pubkey::new_from_array(escrow_arr),
+                    salt,
+                ),
+                slot,
+            ),
+            birth_sig,
+        );
+        assert!(
+            matches!(r, IngestResult::Applied { births: 1, .. }),
+            "collection {recipient_nonce}: the birth must fold: {r:?}"
+        );
+
+        derived.push((
+            recipient_nonce,
+            nonce,
+            choice,
+            outcome,
+            collection_hex,
+            resolver,
+            escrow_arr,
+        ));
+    }
+
+    // ---- the voter buys its weight: one real settlement, folded by the index ----
+    // Above the index's dust floor ($0.20) **and** above `quorum_weight`, or the
+    // ballot would be inquorate — and an inquorate vote no longer refunds anything,
+    // it settles, which would make the `not_done` case pass for the wrong reason.
+    let weight_gross = 500_000u64;
+    let r = ingest(
+        &pic,
+        mock,
+        proxy,
+        index,
+        consistent_reply(
+            settlement_tx(Pubkey::new_from_array(voter), recipient, weight_gross),
+            slot + 1,
+        ),
+        "sig-cf-weight",
+    );
+    assert!(
+        matches!(
+            r,
+            IngestResult::Applied {
+                settlements: 1,
+                anomalies: 0,
+                ..
+            }
+        ),
+        "the voter's donation must fold into reputation: {r:?}"
+    );
+
+    let chain = conditional_funding::field::chain_id("devnet");
+    let repq = pic
+        .query_call(
+            index,
+            anon(),
+            "get_reputation",
+            Encode!(&chain.to_vec(), &voter.to_vec(), &recipient.to_vec()).unwrap(),
+        )
+        .expect("get_reputation");
+    let (weight, weight_witness) = Decode!(&repq, candid::Nat, Vec<u8>).unwrap();
+    assert_eq!(
+        weight,
+        candid::Nat::from(weight_gross),
+        "the book credits the voter at this recipient"
+    );
+    assert!(
+        u128::from(weight_gross) >= QUORUM_WEIGHT,
+        "one voter must carry the quorum, or the vote decides nothing"
+    );
+
+    // ---- one paid root refresh covers every proof above ----
+    let cq = pic
+        .query_call(index, anon(), "get_certificate", Encode!().unwrap())
+        .expect("get_certificate");
+    let cert = Decode!(&cq, Option<Vec<u8>>, Vec<u8>)
+        .unwrap()
+        .0
+        .expect("certificate present");
+    let pr = relay(
+        &pic,
+        proxy,
+        game,
+        "push_root",
+        Encode!(&cert).unwrap(),
+        ROOT_PRICE,
+    );
+    assert!(
+        matches!(
+            Decode!(&pr, CollectionResult).unwrap(),
+            CollectionResult::RootPushed
+        ),
+        "the index certificate authenticates a root"
+    );
+
+    // ---- create → ready → vote, both collections, direct ingress ----
+    for (recipient_nonce, nonce, choice, _outcome, collection_hex, _resolver, escrow_arr) in
+        &derived
+    {
+        let bq = pic
+            .query_call(
+                index,
+                anon(),
+                "get_birth",
+                Encode!(&escrow_arr.to_vec()).unwrap(),
+            )
+            .expect("get_birth");
+        let witness = Decode!(&bq, Option<BirthView>, Vec<u8>).unwrap().1;
+
+        let msg =
+            protocol::create_message("devnet", &game.to_text(), collection_hex, goal, duration);
+        let extras = vec![
+            ("recipient_nonce", recipient_nonce.to_string()),
+            ("donor", bs58::encode(donor).into_string()),
+            ("gross", gross.to_string()),
+            ("deadline", deadline.to_string()),
+            ("nonce", nonce.to_string()),
+            ("witness", hex::encode(&witness)),
+        ];
+        let cr = pic
+            .update_call(
+                game,
+                anon(),
+                "create_collection",
+                Encode!(&signed_request(&recipient_sk, &msg, &extras)).unwrap(),
+            )
+            .expect("create must be admitted");
+        assert!(
+            matches!(
+                Decode!(&cr, CollectionResult).unwrap(),
+                CollectionResult::Materialized
+            ),
+            "collection {recipient_nonce}: create must materialize"
+        );
+
+        let ready_text = signed_request(
+            &recipient_sk,
+            &protocol::ready_message("devnet", &game.to_text(), collection_hex),
+            &[],
+        );
+
+        // Size is cut **first**, before anything is parsed (`MAX_ARG_BYTES` = 8 KiB).
+        // Padded with an unsigned extra the parser would otherwise ignore, so this
+        // request is valid in every other respect — the *only* reason it dies is its
+        // length, and the unpadded twin below proves it by being admitted.
+        let padded = format!("{ready_text}\npadding: {}", "x".repeat(9_000));
+        assert!(
+            padded.len() > 8 * 1024,
+            "the padded request has to actually exceed the cap"
+        );
+        assert!(
+            pic.update_call(game, anon(), "ready", Encode!(&padded).unwrap())
+                .is_err(),
+            "collection {recipient_nonce}: an oversized ingress must be dropped before it is parsed"
+        );
+
+        let rr = pic
+            .update_call(game, anon(), "ready", Encode!(&ready_text).unwrap())
+            .expect("ready admitted");
+        assert!(
+            matches!(
+                Decode!(&rr, CollectionResult).unwrap(),
+                CollectionResult::Advanced(CollectionStateView::Voting)
+            ),
+            "collection {recipient_nonce}: ready must open the voting window"
+        );
+
+        // Byte-identical replay of a now-doomed action. The signed half carries no
+        // nonce, so one observed valid message is a flood template; the boundary
+        // refuses it by **state**, not just by signer, and the canister is never
+        // billed for the round (`cost.md §6` #2).
+        assert!(
+            pic.update_call(game, anon(), "ready", Encode!(&ready_text).unwrap())
+                .is_err(),
+            "collection {recipient_nonce}: a second ready is doomed and must die at the boundary"
+        );
+
+        // The ballot. Its weight is proven, not asserted: a hash-tree walk over the
+        // reputation witness against the root pushed above — the same path
+        // `inspect_message` ran to admit this very call.
+        let vr = pic
+            .update_call(
+                game,
+                anon(),
+                "vote",
+                Encode!(&signed_request(
+                    &voter_sk,
+                    &protocol::vote_message("devnet", &game.to_text(), collection_hex, choice),
+                    &[("weight_witness", hex::encode(&weight_witness))]
+                ))
+                .unwrap(),
+            )
+            .unwrap_or_else(|e| {
+                panic!("collection {recipient_nonce}: a weight-proven vote must be admitted: {e:?}")
+            });
+        assert!(
+            matches!(
+                Decode!(&vr, CollectionResult).unwrap(),
+                CollectionResult::Advanced(CollectionStateView::Voting)
+            ),
+            "collection {recipient_nonce}: the vote is recorded and the window stays open"
+        );
+    }
+
+    // ---- the window closes on its own: no timer, a pure function of the clock ----
+    pic.advance_time(std::time::Duration::from_secs(VOTING_PERIOD + 1));
+    pic.tick();
+
+    for (recipient_nonce, _, choice, outcome, collection_hex, resolver, _) in &derived {
+        let cq = pic
+            .query_call(
+                game,
+                anon(),
+                "get_collection",
+                Encode!(collection_hex).unwrap(),
+            )
+            .expect("get_collection");
+        let got = Decode!(&cq, Option<CollectionStateView>)
+            .unwrap()
+            .expect("the tally is lazy but total — reading past the window decides");
+        let decided_as_expected = matches!(
+            (*outcome, got),
+            (0, CollectionStateView::DecidedSettle) | (1, CollectionStateView::DecidedRefund)
+        );
+        assert!(
+            decided_as_expected,
+            "collection {recipient_nonce}: a quorate `{choice}` vote must decide outcome {outcome}, got {got:?}"
+        );
+
+        let sr = relay(
+            &pic,
+            proxy,
+            game,
+            "request_signature",
+            Encode!(&"devnet".to_string(), collection_hex).unwrap(),
+            SIGN_PRICE,
+        );
+        let signature = match Decode!(&sr, CollectionResult).unwrap() {
+            CollectionResult::Signed {
+                outcome: got_outcome,
+                signature,
+            } => {
+                assert_eq!(
+                    got_outcome, *outcome,
+                    "collection {recipient_nonce}: signed outcome"
+                );
+                assert_eq!(signature.len(), 64, "a 64-byte Ed25519 signature");
+                signature
+            }
+            other => panic!("collection {recipient_nonce}: expected Signed, got {other:?}"),
+        };
+
+        // What Solana's ed25519 program (and `two-outcome`'s `assert_resolver_signed`)
+        // checks — one signature per collection, reused by every escrow of the set.
+        let mut verdict = b"crown:two-outcome:devnet".to_vec();
+        verdict.extend_from_slice(&factory());
+        verdict.push(*outcome);
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(resolver)
+            .expect("resolver is a valid Ed25519 public key");
+        let sig = ed25519_dalek::Signature::from_slice(&signature).expect("64-byte signature");
+        vk.verify_strict(&verdict, &sig).unwrap_or_else(|e| {
+            panic!("collection {recipient_nonce}: the verdict signature must verify: {e:?}")
+        });
+    }
 }

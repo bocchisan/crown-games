@@ -176,6 +176,55 @@ fn inspect_message_drops_a_malformed_vote() {
     assert!(res.is_err(), "inspect_message must drop the malformed vote");
 }
 
+/// The paid pulls are relay-fronted (inter-canister) and never pass the boundary;
+/// a **direct** ingress on either must be dropped, not executed (spec §Граница).
+/// The mechanism is that neither decodes as the single signed `text` every
+/// state-changing method takes — which is a claim about `inspect_message`, not
+/// about candid, so it is worth a test rather than a sentence. Both calls below
+/// carry the arguments the method actually declares; they are dropped anyway,
+/// because ingress cannot pay and an unpaid pull is work nobody ordered.
+#[test]
+fn a_direct_ingress_on_the_paid_pulls_is_dropped() {
+    let (pic, game, _proxy) = setup();
+
+    let sig = pic.update_call(
+        game,
+        Principal::anonymous(),
+        "request_signature",
+        Encode!(&CHAIN.to_string(), &unknown_task()).unwrap(),
+    );
+    assert!(
+        sig.is_err(),
+        "a direct ingress on request_signature must be dropped at the boundary"
+    );
+
+    let root = pic.update_call(
+        game,
+        Principal::anonymous(),
+        "push_root",
+        Encode!(&vec![0u8; 64]).unwrap(),
+    );
+    assert!(
+        root.is_err(),
+        "a direct ingress on push_root must be dropped at the boundary"
+    );
+}
+
+/// An unknown method is not admissible either — `admissible` has no `_ =>` that
+/// accepts. Without this the boundary's default would be the interesting one: a
+/// method added later and forgotten here would be admitted for free.
+#[test]
+fn an_unknown_method_is_not_admissible() {
+    let (pic, game, _proxy) = setup();
+    let res = pic.update_call(
+        game,
+        Principal::anonymous(),
+        "no_such_method",
+        Encode!(&"anything".to_string()).unwrap(),
+    );
+    assert!(res.is_err(), "an unknown method must never be admitted");
+}
+
 #[test]
 fn queries_wire_through() {
     let (pic, game, _proxy) = setup();
@@ -188,7 +237,7 @@ fn queries_wire_through() {
             Encode!().unwrap(),
         )
         .expect("get_logic_version");
-    assert_eq!(Decode!(&v, u32).unwrap(), 4); // conditional-tasks LOGIC_VERSION
+    assert_eq!(Decode!(&v, u32).unwrap(), 5); // conditional-tasks LOGIC_VERSION
 
     let g = pic
         .query_call(
