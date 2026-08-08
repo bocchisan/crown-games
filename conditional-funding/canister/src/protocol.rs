@@ -4,10 +4,10 @@
 
 use sha2::{Digest, Sha256};
 
-// The verdict message (`domain ‖ program_id(32) ‖ u8(outcome)`) and the Ed25519
-// wallet-signature check are identical across every `two-outcome` game — they
-// live in `crown-games-common`. Re-exported so `protocol::verify` /
-// `protocol::verdict_message` call sites and tests stay unchanged.
+// The verdict message (`domain ‖ program_id(32) ‖ u8(outcome) ‖ u16le(fee_bps) ‖
+// fee_wallet(32)`) and the Ed25519 wallet-signature check are identical across
+// every `two-outcome` game — they live in `crown-games-common`. Re-exported so
+// `protocol::verify` / `protocol::verdict_message` call sites stay unchanged.
 pub use crown_games_common::wallet::{verdict_message, verify};
 
 /// Domain of the wallet-signed messages.
@@ -149,11 +149,42 @@ mod tests {
     #[test]
     fn verdict_message_is_byte_exact() {
         let program = [7u8; 32];
-        let m = verdict_message("crown:two-outcome:devnet", &program, 0);
+        let wallet = [4u8; 32];
+        let m = verdict_message("crown:two-outcome:devnet", &program, 0, 300, &wallet);
         let mut expected = b"crown:two-outcome:devnet".to_vec();
         expected.extend_from_slice(&program);
         expected.push(0);
+        expected.extend_from_slice(&300u16.to_le_bytes());
+        expected.extend_from_slice(&wallet);
         assert_eq!(m, expected);
+    }
+
+    /// The fee binding matters most here: a collection's membership **is** the
+    /// shared resolver, so contributions after the first are never seen by this
+    /// canister at all. Signing the config price list is what stops one of them
+    /// from settling under the collection's verdict at `fee_bps = 0`
+    /// (harness §9, `crown-games-common::wallet`).
+    #[test]
+    fn the_signed_verdict_carries_this_games_own_fee() {
+        let program = crate::config::FACTORY;
+        let signed = verdict_message(
+            crate::config::DOMAIN,
+            &program,
+            0,
+            crate::config::FEE_BPS,
+            &crate::config::FEE_WALLET,
+        );
+        assert_ne!(
+            signed,
+            verdict_message(
+                crate::config::DOMAIN,
+                &program,
+                0,
+                0,
+                &crate::config::FEE_WALLET
+            ),
+            "a fee-free contribution must not share the collection's verdict message"
+        );
     }
 
     #[test]

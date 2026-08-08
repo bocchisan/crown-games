@@ -3,8 +3,6 @@ type CollectionResult = variant {
   Advanced : CollectionStateView;
   Underpaid;
   DurationOutOfRange;
-  // A `create` without a birth proof: derivation echo only, zero writes.
-  Derived : record { resolver : text; collection : text };
   // A certified index root was authenticated and cached.
   RootPushed;
   VoteCapReached;
@@ -42,6 +40,30 @@ type CollectionStateView = variant {
   Voting;
   Funding;
 };
+// A materialized collection, for `get_collection` — the state **and the window
+// it runs on**.
+// 
+// The anchors are not decoration: a contribution's escrow has to be born with
+// `deadline >= created_at + duration + voting_period + DEADLINE_MARGIN` (72h),
+// the canister verifies that only for the one contribution that materialized the
+// collection, and every later contribution joins by deriving the resolver
+// without ever being presented here. So the arithmetic is the donor's, and until
+// these fields were published there was nothing to do it with: `collection_id` is
+// a hash, so neither `created_at` nor the recipient is recoverable from it. A
+// client that guessed low made its escrow refundable before the verdict.
+type CollectionView = record {
+  // Funding-window length; `Funding` runs `[created_at, created_at+duration]`.
+  duration : nat64;
+  // Voting-window length, from config and baked into `collection_id`.
+  voting_period : nat64;
+  // The collection's recipient (base58, as `get_resolver` returns the
+  // resolver) — a contribution's escrow salt commits it.
+  recipient : text;
+  // Birth time of the contribution the collection was materialized from (unix
+  // seconds, slot→time through the pinned anchor). Start of both windows.
+  created_at : nat64;
+  state : CollectionStateView;
+};
 // Deploy-time overrides (testnet): the index principal and the NNS root key
 // (PocketIC / a test IC differ from mainnet). Barred on mainnet.
 type InitArgs = record { nns_root_key : blob; index : principal };
@@ -51,15 +73,40 @@ service : (opt InitArgs) -> {
   // Fetch and cache the threshold master public key (one-time, idempotent). Must
   // run after deploy before donors can query resolvers. `init` cannot (it is
   // sync) and timers are barred, so this is an explicit setup call.
+  // 
+  // **Rate-limited rather than latched, and the difference is the whole design.**
+  // The key only lands *after* the `await`, so until it does, `MASTER` is still
+  // empty and every concurrent caller passes the check above — anonymous, unpaid,
+  // one management call each. The obvious fix is the claim-before-`await` that
+  // `signing` uses; here it would be a bug. A claim taken before the `await`
+  // survives a trapped callback, and this claim is not per-scope but per-canister:
+  // one stuck flag and the game can never take its key, i.e. no resolver is ever
+  // derivable and every escrow of every collection is left to `refund()`. So the
+  // gate is a timestamp instead: it bounds the flood to one attempt per window and
+  // **heals by itself**, because time passes whatever happened to the callback.
   bootstrap : () -> (CollectionResult);
   // Lazy creation (recipient-signed). Admit the request (via `admit_create_collection`,
   // also run at the boundary so a bogus cert never reaches replicated execution),
-  // then perform the one thing a boundary check must not: the write. A `create`
-  // without a birth proof echoes the derivation (`Derived`, zero writes); a valid
-  // birth proof materializes the `Funding` collection. `ready`/`recipient_cancel`
-  // never materialize.
+  // then perform the one thing a boundary check must not: the write.
+  // `ready`/`recipient_cancel` never materialize.
+  // 
+  // **A birth proof is required, and the derivation echo is gone** (`P8`). The
+  // method used to answer a proof-less `create` with `Derived` — the `id` and the
+  // resolver, zero writes — and the boundary admitted it, because "zero writes" was
+  // read as "harmless". It is not: the sender signs their *own* `create` (the
+  // recipient of a collection is `req.pubkey`), so anyone could mint a valid
+  // proof-less request from a fresh key and have it executed **replicated** —
+  // `verify_strict` + SHA-256 + an Ed25519 subkey derivation per copy, free to send,
+  // unbounded, billed to this canister. That is exactly the flood template
+  // `admit_action` was given a state check to stop (harness §6), and the echo was
+  // the one path with no proof in front of it at all.
+  // 
+  // Nothing is lost with it. The caller already holds `collection_id` before the
+  // call — it is a *signed* field of the message, so they computed it to sign — and
+  // the resolver is `get_resolver`, a free `query`. The echo answered with what the
+  // asker already had.
   create_collection : (text) -> (CollectionResult);
-  get_collection : (text) -> (opt CollectionStateView) query;
+  get_collection : (text) -> (opt CollectionView) query;
   get_logic_version : () -> (nat32) query;
   get_resolver : (text) -> (opt text) query;
   // The verdict signature already produced for a collection, if any. Free query —

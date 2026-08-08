@@ -10,6 +10,12 @@
 //!
 //! Used from `build.rs` only. Each game still decides **which** keys it bakes and
 //! what they mean; that is the part that is genuinely per-game.
+//!
+//! Exempt from the crate's no-panic ban, and deliberately: a panic here is a
+//! **failed build**, which is the whole mechanism — a missing key or a mainnet
+//! placeholder must not compile. The ban exists for the runtime half, where a
+//! panic is a trap on a live canister.
+#![allow(clippy::panic)]
 
 /// The raw value token of `key = <token>`: the text before any trailing `#`
 /// comment, trimmed, with one layer of quotes removed. Panics if the key is

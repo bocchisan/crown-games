@@ -351,6 +351,34 @@ mod tests {
         assert!(!principal_in_ranges(&[0x0A, 0x7F], &ranges_cbor(&[])));
     }
 
+    /// Pathologically nested CBOR is refused, not survived by luck.
+    ///
+    /// Every verifier here decodes attacker-chosen bytes into a **recursive**
+    /// type (`HashTree` forks, `Certificate` trees), and both the decode and the
+    /// `digest()`/`lookup_path` walks that follow are recursive too. The thing
+    /// that makes this safe is a depth cap — `serde_cbor` refuses past 128 levels
+    /// unless a caller explicitly opts out — and it is a *dependency default*,
+    /// which is exactly the kind of load-bearing fact that disappears in a bump or
+    /// a crate swap. `MAX_ARG_BYTES` alone would not do it: 8 KiB of the one-byte
+    /// nesting header below is ~8 000 levels.
+    ///
+    /// So the property is asserted rather than assumed. Reaching this assertion at
+    /// all is half the test: a run that blew the stack would not report a failure,
+    /// it would abort.
+    #[test]
+    fn pathologically_nested_cbor_is_refused() {
+        // `0x81` = a definite-length array of one element; repeat it and the value
+        // nests once per byte. 8 KiB is the boundary's own argument cap, i.e. the
+        // deepest thing a caller could ever get in front of these functions.
+        let mut deep = vec![0x81u8; 8 * 1024];
+        deep.push(0x00); // the innermost value
+        let root = [0u8; 32];
+        let id = [0u8; 32];
+        assert!(birth_from_witness(&deep, &root, &id).is_none());
+        assert!(reputation_from_witness(&deep, &root, &id, &id, &id).is_none());
+        assert!(certified_root(&deep, IC_MAINNET_ROOT_KEY, &id).is_none());
+    }
+
     #[test]
     fn malformed_bytes_never_panic() {
         // A blind game verifies attacker-supplied proofs on the hot path: every

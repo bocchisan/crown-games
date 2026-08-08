@@ -1,13 +1,32 @@
+#![forbid(unsafe_code)]
+// The same crate-level ban `crown-reduce`, the index and this game's `logic/`
+// already carry, extended to the canister — the half that actually reads hostile
+// bytes. Every state-changing method takes an attacker-chosen `text` and runs it
+// twice: once non-replicated on the anonymous boundary and once replicated. A
+// panic on either is a denial of service that costs the sender nothing, and an
+// unmarked overflow is a wrong verdict. Tests are exempt — `unwrap` in a test *is*
+// the assertion.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing
+    )
+)]
 //! conditional-funding canister — a crowdfunding collection on the `two-outcome`
 //! form. Blind and registryless: escrow membership is by the `resolver` field
 //! (derivation), not a list. Area = collection, `B=N`; one verdict signature is
 //! reused by all `N` escrows (F4).
 //!
-//! F2: lazy creation. `create_collection` derives `collection_id` + resolver and,
-//! given a birth proof of the first funded contribution, materializes the
-//! collection (fixing `created_at` from the birth slot) — without a proof it
-//! writes nothing. `ready`/`recipient_cancel` are free, self-signed, and never
-//! materialize. Voting (F3) and the paid verdict pull (F4) land at their stages.
+//! F2: lazy creation. `create_collection` takes a birth proof of the first funded
+//! contribution and materializes the collection (fixing `created_at` from the
+//! birth slot); the proof is required, and a `create` without one is dropped at
+//! the boundary rather than answered with a derivation echo (see the method).
+//! `ready`/`recipient_cancel` are free, self-signed, and never materialize.
+//! Voting (F3) and the paid verdict pull (F4) land at their stages.
 
 use candid::{CandidType, Deserialize, Principal};
 use conditional_funding_logic::{Collection, Outcome, State, Vote, LOGIC_VERSION, MIN_VOTE_WEIGHT};
@@ -37,6 +56,9 @@ thread_local! {
     static INDEX: RefCell<Principal> = const { RefCell::new(Principal::anonymous()) };
     /// NNS root key that authenticates the index's certificate (blind proof).
     static NNS_ROOT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Unix seconds of the last `bootstrap` attempt (0 = none). A timestamp, not
+    /// a latch — see `bootstrap`.
+    static LAST_BOOTSTRAP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Recently verified index roots (newest last). A birth/reputation witness is
     /// admitted against any of them; the BLS that authenticates a root runs once,
     /// on the paid `push_root`, never on the anonymous boundary. Canister state,
@@ -68,16 +90,37 @@ pub struct SignatureView {
     pub signature: Vec<u8>,
 }
 
+/// A materialized collection, for `get_collection` — the state **and the window
+/// it runs on**.
+///
+/// The anchors are not decoration: a contribution's escrow has to be born with
+/// `deadline >= created_at + duration + voting_period + DEADLINE_MARGIN` (72h),
+/// the canister verifies that only for the one contribution that materialized the
+/// collection, and every later contribution joins by deriving the resolver
+/// without ever being presented here. So the arithmetic is the donor's, and until
+/// these fields were published there was nothing to do it with: `collection_id` is
+/// a hash, so neither `created_at` nor the recipient is recoverable from it. A
+/// client that guessed low made its escrow refundable before the verdict.
+#[derive(CandidType, Deserialize, Clone, Debug)]
+pub struct CollectionView {
+    pub state: CollectionStateView,
+    /// Birth time of the contribution the collection was materialized from (unix
+    /// seconds, slot→time through the pinned anchor). Start of both windows.
+    pub created_at: u64,
+    /// Funding-window length; `Funding` runs `[created_at, created_at+duration]`.
+    pub duration: u64,
+    /// Voting-window length, from config and baked into `collection_id`.
+    pub voting_period: u64,
+    /// The collection's recipient (base58, as `get_resolver` returns the
+    /// resolver) — a contribution's escrow salt commits it.
+    pub recipient: String,
+}
+
 /// Outcome of an update — flat and typed.
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub enum CollectionResult {
     // success
     Materialized,
-    /// A `create` without a birth proof: derivation echo only, zero writes.
-    Derived {
-        collection: String,
-        resolver: String,
-    },
     Advanced(CollectionStateView),
     KeyBootstrapped,
     /// A verdict signature: `outcome` (settle=0/refund=1) + the schnorr signature.
@@ -142,10 +185,24 @@ fn init(overrides: Option<InitArgs>) {
 /// Fetch and cache the threshold master public key (one-time, idempotent). Must
 /// run after deploy before donors can query resolvers. `init` cannot (it is
 /// sync) and timers are barred, so this is an explicit setup call.
+///
+/// **Rate-limited rather than latched, and the difference is the whole design.**
+/// The key only lands *after* the `await`, so until it does, `MASTER` is still
+/// empty and every concurrent caller passes the check above — anonymous, unpaid,
+/// one management call each. The obvious fix is the claim-before-`await` that
+/// `signing` uses; here it would be a bug. A claim taken before the `await`
+/// survives a trapped callback, and this claim is not per-scope but per-canister:
+/// one stuck flag and the game can never take its key, i.e. no resolver is ever
+/// derivable and every escrow of every collection is left to `refund()`. So the
+/// gate is a timestamp instead: it bounds the flood to one attempt per window and
+/// **heals by itself**, because time passes whatever happened to the callback.
 #[ic_cdk::update]
 async fn bootstrap() -> CollectionResult {
     if MASTER.with_borrow(|m| m.is_some()) {
         return CollectionResult::KeyBootstrapped;
+    }
+    if !claim_bootstrap_window(now_secs()) {
+        return CollectionResult::NotBootstrapped;
     }
     let arg = SchnorrPublicKeyArgs {
         canister_id: None,
@@ -172,24 +229,30 @@ async fn bootstrap() -> CollectionResult {
 
 /// Lazy creation (recipient-signed). Admit the request (via `admit_create_collection`,
 /// also run at the boundary so a bogus cert never reaches replicated execution),
-/// then perform the one thing a boundary check must not: the write. A `create`
-/// without a birth proof echoes the derivation (`Derived`, zero writes); a valid
-/// birth proof materializes the `Funding` collection. `ready`/`recipient_cancel`
-/// never materialize.
+/// then perform the one thing a boundary check must not: the write.
+/// `ready`/`recipient_cancel` never materialize.
+///
+/// **A birth proof is required, and the derivation echo is gone** (`P8`). The
+/// method used to answer a proof-less `create` with `Derived` — the `id` and the
+/// resolver, zero writes — and the boundary admitted it, because "zero writes" was
+/// read as "harmless". It is not: the sender signs their *own* `create` (the
+/// recipient of a collection is `req.pubkey`), so anyone could mint a valid
+/// proof-less request from a fresh key and have it executed **replicated** —
+/// `verify_strict` + SHA-256 + an Ed25519 subkey derivation per copy, free to send,
+/// unbounded, billed to this canister. That is exactly the flood template
+/// `admit_action` was given a state check to stop (harness §6), and the echo was
+/// the one path with no proof in front of it at all.
+///
+/// Nothing is lost with it. The caller already holds `collection_id` before the
+/// call — it is a *signed* field of the message, so they computed it to sign — and
+/// the resolver is `get_resolver`, a free `query`. The echo answered with what the
+/// asker already had.
 #[ic_cdk::update]
 fn create_collection(text: String) -> CollectionResult {
     match admit_create_collection(&text) {
-        // No proof: the whole method was a derivation echo — nothing to persist.
-        Ok(Admitted::Echo {
-            collection_id,
-            resolver_key,
-        }) => CollectionResult::Derived {
-            collection: hex::encode(collection_id),
-            resolver: bs58::encode(resolver_key).into_string(),
-        },
-        // Valid birth proof: the only step deferred past the boundary is the
-        // replicated write (the boundary is read-only).
-        Ok(Admitted::Materialize {
+        // The only step deferred past the boundary is the replicated write (the
+        // boundary is read-only).
+        Ok(Admitted {
             collection_id,
             collection,
             recipient,
@@ -245,7 +308,17 @@ fn inspect_message() {
     // `bootstrap` carries no `text` and is a one-shot fetch — admit only until
     // the master key lands, so a repeat is dropped for free.
     if method == "bootstrap" {
-        if MASTER.with_borrow(|m| m.is_none()) {
+        // Admitted only while the key is missing **and** no recent attempt still
+        // holds the window (`bootstrap`), so a burst is dropped free instead of
+        // executing replicated. Read-only: the window is *taken* by the update,
+        // never here — the boundary must not consume what it only inspects.
+        //
+        // Unlike the state checks in `admit_*`, this refusal is one time undoes
+        // (the window reopens). That is fine for the method it guards and only
+        // for it: `bootstrap` is an operator call with no deadline, retried
+        // seconds later at no cost, and never on a user's critical path.
+        let free = LAST_BOOTSTRAP.with(|t| bootstrap_window_free(t.get(), now_secs()));
+        if free && MASTER.with_borrow(|m| m.is_none()) {
             ic_cdk::api::accept_message();
         }
         return;
@@ -276,6 +349,15 @@ fn inspect_message() {
 /// (`01-standards §Тесты 4`).
 #[ic_cdk::update]
 fn push_root(cert: Vec<u8>) -> CollectionResult {
+    // `MAX_ARG_BYTES` lives in `inspect_message`, which **inter-canister calls do
+    // not run** — and this method is only ever reached that way. Re-asserted here
+    // for the same reason the relay re-asserts it on its own replicated path: the
+    // cap is a cost knob (harness §6), and without it one caller can hand this
+    // canister a multi-megabyte blob to CBOR-decode. Cheapest possible check, so
+    // it goes ahead of the payment one.
+    if cert.len() > MAX_ARG_BYTES {
+        return CollectionResult::Malformed;
+    }
     if ic_cdk::api::msg_cycles_available() < config::ROOT_PRICE {
         return CollectionResult::Underpaid;
     }
@@ -300,6 +382,12 @@ fn push_root(cert: Vec<u8>) -> CollectionResult {
 async fn request_signature(chain: String, collection: String) -> CollectionResult {
     if chain != config::CHAIN_ID {
         return CollectionResult::WrongTarget;
+    }
+    // Same reason as `push_root`: no `inspect_message` on the inter-canister path.
+    // A `collection` is 32 bytes of hex and nothing else, so bound it before
+    // `hex32` decodes — a hex decode allocates half the input.
+    if collection.len() > MAX_ARG_BYTES {
+        return CollectionResult::Malformed;
     }
     let Some(collection_id) = field::hex32(&collection) else {
         return CollectionResult::Malformed;
@@ -328,7 +416,16 @@ async fn request_signature(chain: String, collection: String) -> CollectionResul
     // Payment accepted only now, before the (paid) threshold signature.
     ic_cdk::api::msg_cycles_accept(config::SIGN_PRICE);
     let arg = SignWithSchnorrArgs {
-        message: protocol::verdict_message(config::DOMAIN, &config::FACTORY, outcome),
+        // The consumer's own price list rides in the signed message, so the
+        // signature cannot open an escrow that joined this scope by deriving the
+        // resolver and set its own fee (`crown-games-common::wallet`, harness §9).
+        message: protocol::verdict_message(
+            config::DOMAIN,
+            &config::FACTORY,
+            outcome,
+            config::FEE_BPS,
+            &config::FEE_WALLET,
+        ),
         derivation_path: vec![collection_id.to_vec()],
         key_id: SchnorrKeyId {
             algorithm: SchnorrAlgorithm::Ed25519,
@@ -376,9 +473,16 @@ fn get_signature(collection: String) -> Option<SignatureView> {
 }
 
 #[ic_cdk::query]
-fn get_collection(collection: String) -> Option<CollectionStateView> {
+fn get_collection(collection: String) -> Option<CollectionView> {
     let id = field::hex32(&collection)?;
-    state::collection_state(&id, now_secs()).map(state_view)
+    let v = state::collection_view(&id, now_secs())?;
+    Some(CollectionView {
+        state: state_view(v.state),
+        created_at: v.created_at,
+        duration: v.duration,
+        voting_period: v.voting_period,
+        recipient: bs58::encode(v.recipient).into_string(),
+    })
 }
 
 // ---- helpers ----
@@ -429,37 +533,28 @@ fn voter_weight(
 // (`add_vote`, `recipient_action`) stay in the update body.
 
 /// A `create` that passed every proof/field check — what the update must still
-/// commit. Split so the read-only boundary never writes: `Echo` is a pure
-/// derivation (zero memory, harness #4), `Materialize` carries a validated birth
-/// proof and the record to insert.
-enum Admitted {
-    /// No cert/witness → derivation echo only; the update writes nothing.
-    Echo {
-        collection_id: [u8; 32],
-        resolver_key: [u8; 32],
-    },
-    /// A valid birth proof → the update materializes this `Funding` collection.
-    Materialize {
-        collection_id: [u8; 32],
-        collection: Collection,
-        recipient: [u8; 32],
-    },
+/// commit. A struct, not an enum: the only admissible `create` is one carrying a
+/// validated birth proof, so there is exactly one thing left to do with it (the
+/// write the read-only boundary must not perform).
+struct Admitted {
+    collection_id: [u8; 32],
+    collection: Collection,
+    recipient: [u8; 32],
 }
 
 /// Admit a `create_collection`: signature + target + `collection_id` recompute/
-/// match + resolver derivation, then — if a birth proof is attached — the blind
-/// proof (BLS vs NNS root → witness → birth, field-matched) and the time-free
-/// registration validation (`created_at` fixed from the birth slot, not `now`).
-/// Everything the current update did **except** the final `state::materialize`,
-/// which is the one write a read-only boundary must not perform. `Err` carries
-/// the exact `CollectionResult` the update returns at that point — notably a
-/// bogus `cert` (BLS fails) is `BadBirthProof`, the expensive flood the boundary
-/// drops non-replicated.
+/// match + resolver derivation + the blind birth proof (witness against a cached
+/// root, field-matched) + the time-free registration validation (`created_at`
+/// fixed from the birth slot, not `now`). Everything the update does **except**
+/// the final `state::materialize`, which is the one write a read-only boundary
+/// must not perform. `Err` carries the exact `CollectionResult` the update
+/// returns at that point — notably a witness against no cached root is
+/// `BadBirthProof`, dropped non-replicated.
 fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
     let Some((master_pk, chain_code)) = MASTER.with_borrow(|m| *m) else {
         return Err(CollectionResult::NotBootstrapped);
     };
-    let Some(req) = request::parse(text) else {
+    let Some(req) = request::parse(text, protocol::DOMAIN) else {
         return Err(CollectionResult::Malformed);
     };
     if req.signed("action") != Some("create") || !target_ok(&req) {
@@ -490,18 +585,26 @@ fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
         return Err(CollectionResult::CollectionIdMismatch);
     }
 
+    // Already materialized → a replayed `create` is a no-op, and it is doomed on
+    // `collection_id` alone. So it dies here, before the two derivations below —
+    // a threshold subkey and a PDA bump search, both of which the boundary would
+    // otherwise redo on every copy of a message that replays for free (the signed
+    // half carries no nonce, harness §6). The update's `materialize` re-checks
+    // (`AlreadyExists`) authoritatively.
+    if state::is_materialized(&collection_id) {
+        return Err(CollectionResult::AlreadyExists);
+    }
+
     let Some(resolver_key) = resolver::resolver(&master_pk, &chain_code, &collection_id) else {
         return Err(CollectionResult::Malformed);
     };
 
-    // No birth proof → derivation echo only (harness: create without a proof
-    // grows no memory). Only the witness is needed: the root it reconstructs
-    // against was authenticated earlier, on the paid `push_root`.
+    // The witness is mandatory: a `create` with nothing to prove has nothing to
+    // execute replicated (see `create_collection`). Only the witness is needed —
+    // the root it reconstructs against was authenticated earlier, on the paid
+    // `push_root`.
     let Some(witness) = field::hex_bytes(req.extra("witness")) else {
-        return Ok(Admitted::Echo {
-            collection_id,
-            resolver_key,
-        });
+        return Err(CollectionResult::Malformed);
     };
 
     // The first funded contribution's escrow fields (unsigned extras; pinned by
@@ -531,19 +634,11 @@ fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
         return Err(CollectionResult::BadBirthProof);
     };
 
-    // Already materialized → a replayed birth proof is a no-op; drop it before the
-    // BLS so a replay can't force the pairing on the replicated path (harness §6).
-    // The update's `materialize` re-checks (`AlreadyExists`) authoritatively; an
-    // echo (no proof) returned above is unaffected.
-    if state::is_materialized(&collection_id) {
-        return Err(CollectionResult::AlreadyExists);
-    }
-
     // Blind birth proof, boundary half: the witness is reconstructed against an
     // already-authenticated index root (`push_root` did the BLS, paid). A pure
     // hash-tree walk, O(log n) — it fits the `inspect_message` budget, which the
     // certificate's pairings do not (`push_root`).
-    let Some((_, b)) = ROOTS.with_borrow(|cache| roots::birth(cache, &witness, &escrow)) else {
+    let Some(b) = ROOTS.with_borrow(|cache| roots::birth(cache, &witness, &escrow)) else {
         return Err(CollectionResult::BadBirthProof);
     };
     // `gross` is committed via the escrow address, so the birth leaf no longer
@@ -578,7 +673,7 @@ fn admit_create_collection(text: &str) -> Result<Admitted, CollectionResult> {
         quorum_weight: config::QUORUM_WEIGHT,
         approval_threshold: config::APPROVAL_THRESHOLD,
     };
-    Ok(Admitted::Materialize {
+    Ok(Admitted {
         collection_id,
         collection,
         recipient,
@@ -601,7 +696,7 @@ fn admit_action(
     action_name: &str,
     action: &conditional_funding_logic::Action,
 ) -> Result<([u8; 32], [u8; 32]), CollectionResult> {
-    let Some(req) = request::parse(text) else {
+    let Some(req) = request::parse(text, protocol::DOMAIN) else {
         return Err(CollectionResult::Malformed);
     };
     if req.signed("action") != Some(action_name) || !target_ok(&req) {
@@ -620,7 +715,7 @@ fn admit_action(
 /// Returns `(collection_id, vote)`; `state::add_vote` applies the dedup + `V_MAX`
 /// cap and the `Voting`-state gate.
 fn admit_vote(text: &str) -> Result<([u8; 32], Vote), CollectionResult> {
-    let Some(req) = request::parse(text) else {
+    let Some(req) = request::parse(text, protocol::DOMAIN) else {
         return Err(CollectionResult::Malformed);
     };
     if req.signed("action") != Some("vote") || !target_ok(&req) {
@@ -684,6 +779,37 @@ fn now_secs() -> u64 {
     ic_cdk::api::time() / 1_000_000_000
 }
 
+/// Seconds one `bootstrap` attempt reserves. Long enough that a burst collapses
+/// to a single management call, short enough that an operator whose first attempt
+/// failed (a key name the subnet does not provision) is not locked out.
+const BOOTSTRAP_WINDOW_SECS: u64 = 30;
+
+/// Take the `bootstrap` window at `now`, or refuse because a recent attempt still
+/// holds it. Read-only on the boundary (`peek` below) and taken only by the
+/// update, so the boundary drops a burst for free without ever consuming the
+/// window itself.
+fn claim_bootstrap_window(now: u64) -> bool {
+    LAST_BOOTSTRAP.with(|t| {
+        if !bootstrap_window_free(t.get(), now) {
+            return false;
+        }
+        t.set(now);
+        true
+    })
+}
+
+/// Whether the window is free — the pure half, shared by the boundary and the
+/// update so the two cannot disagree.
+///
+/// `now < last` resolves to **open**, not shut. IC time is monotone per canister,
+/// so it should not happen; the point is that if the assumption ever fails, this
+/// gate degrades to "allow", the way every other branch here does. A gate that
+/// answers "shut" to a clock it does not understand is the latch this deliberately
+/// is not (see `bootstrap`).
+fn bootstrap_window_free(last: u64, now: u64) -> bool {
+    last == 0 || now < last || now.saturating_sub(last) >= BOOTSTRAP_WINDOW_SECS
+}
+
 fn state_view(s: State) -> CollectionStateView {
     match s {
         State::Funding => CollectionStateView::Funding,
@@ -723,3 +849,35 @@ fn state_error(e: state::StateError) -> CollectionResult {
 }
 
 ic_cdk::export_candid!();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `bootstrap` window, tested on its pure half — the property that matters
+    /// is that it **reopens**. A latch here would also pass "a burst is refused"
+    /// and then brick the canister on a trapped callback (see `bootstrap`), so the
+    /// reopening case is the one carrying the design, not the refusal.
+    #[test]
+    fn the_bootstrap_window_refuses_a_burst_and_reopens() {
+        // Never attempted → open, whatever the clock says.
+        assert!(bootstrap_window_free(0, 0));
+        assert!(bootstrap_window_free(0, 1_700_000_000));
+
+        let t = 1_700_000_000;
+        assert!(claim_bootstrap_window(t), "the first attempt takes the window");
+        assert!(!claim_bootstrap_window(t), "a sibling in the same round is refused");
+        assert!(
+            !claim_bootstrap_window(t + BOOTSTRAP_WINDOW_SECS - 1),
+            "still held one second before the window closes"
+        );
+        assert!(
+            claim_bootstrap_window(t + BOOTSTRAP_WINDOW_SECS),
+            "and it reopens on its own — nothing has to release it"
+        );
+
+        // A replica clock that moves backwards must open the window, not wrap it
+        // shut for 136 billion years.
+        assert!(bootstrap_window_free(t + 100, t));
+    }
+}

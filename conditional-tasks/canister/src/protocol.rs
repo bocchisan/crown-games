@@ -90,10 +90,11 @@ pub fn vote_message(chain: &str, canister: &str, task_bs58: &str, choice: &str) 
 // There is no `set-profile` message: the recipient's acceptance terms are a
 // client-side filter, not canister state (`P7.14`, `state.rs`).
 
-// The verdict message (`domain ‖ program_id(32) ‖ u8(outcome)`) and the Ed25519
-// wallet-signature check are the same across every `two-outcome` game — they live
-// in `crown-games-common`. Re-exported so `protocol::verify` / `protocol::
-// verdict_message` call sites and tests stay unchanged.
+// The verdict message (`domain ‖ program_id(32) ‖ u8(outcome) ‖ u16le(fee_bps) ‖
+// fee_wallet(32)`) and the Ed25519 wallet-signature check are the same across
+// every `two-outcome` game — they live in `crown-games-common`. Re-exported so
+// `protocol::verify` / `protocol::verdict_message` call sites and tests stay
+// unchanged.
 pub use crown_games_common::wallet::{verdict_message, verify};
 
 #[cfg(test)]
@@ -353,17 +354,47 @@ mod tests {
     #[test]
     fn verdict_message_is_byte_exact() {
         let program = [7u8; 32];
-        let m = verdict_message("crown:two-outcome:devnet", &program, 0);
-        // domain bytes ‖ program_id(32) ‖ outcome(1).
+        let wallet = [4u8; 32];
+        let m = verdict_message("crown:two-outcome:devnet", &program, 0, 300, &wallet);
+        // domain bytes ‖ program_id(32) ‖ outcome(1) ‖ u16le(fee_bps) ‖ fee_wallet(32).
         let mut expected = b"crown:two-outcome:devnet".to_vec();
         expected.extend_from_slice(&program);
         expected.push(0);
+        expected.extend_from_slice(&300u16.to_le_bytes());
+        expected.extend_from_slice(&wallet);
         assert_eq!(m, expected);
-        assert_eq!(m.len(), 24 + 32 + 1);
-        // Settle (0) and cancel (1) differ only in the last byte.
-        let cancel = verdict_message("crown:two-outcome:devnet", &program, 1);
-        assert_eq!(cancel[..cancel.len() - 1], m[..m.len() - 1]);
+        assert_eq!(m.len(), 24 + 32 + 1 + 2 + 32);
+        // Settle (0) and cancel (1) differ only in the outcome byte.
+        let cancel = verdict_message("crown:two-outcome:devnet", &program, 1, 300, &wallet);
+        assert_eq!(cancel.len(), m.len());
         assert_ne!(cancel, m);
+        assert_eq!(cancel[24 + 32 + 1..], m[24 + 32 + 1..]);
+    }
+
+    /// This game signs its **config** fee, never a requested one — so the one
+    /// signature of a task's scope cannot open an escrow that derived the same
+    /// resolver and set `fee_bps = 0` (harness §9, `crown-games-common::wallet`).
+    #[test]
+    fn the_signed_verdict_carries_this_games_own_fee() {
+        let program = crate::config::FACTORY;
+        let signed = verdict_message(
+            crate::config::DOMAIN,
+            &program,
+            0,
+            crate::config::FEE_BPS,
+            &crate::config::FEE_WALLET,
+        );
+        assert_ne!(
+            signed,
+            verdict_message(
+                crate::config::DOMAIN,
+                &program,
+                0,
+                0,
+                &crate::config::FEE_WALLET
+            ),
+            "a fee-free escrow must not share this game's verdict message"
+        );
     }
 
     /// The one thing the framing tests in `crown_games_common::request` cannot
@@ -379,7 +410,7 @@ mod tests {
         let sig = bs58::encode(sk.sign(msg.as_bytes()).to_bytes()).into_string();
         let text = format!("{msg}\n---\npubkey: {pk}\nsignature: {sig}\ngross: 1860000\nnonce: 9");
 
-        let req = parse(&text).expect("a real register message parses");
+        let req = parse(&text, DOMAIN).expect("a real register message parses");
         assert_eq!(req.pubkey, sk.verifying_key().to_bytes());
         assert_eq!(req.signed("action"), Some("register"));
         assert_eq!(req.signed("duration"), Some("3600"));

@@ -77,6 +77,36 @@ fn game_wasm() -> Vec<u8> {
     std::fs::read(GAME_WASM).expect("read conditional-funding wasm")
 }
 
+/// Non-negativity, **measured rather than promised** (`cost.md §6`,
+/// `01-standards §Тесты 4,12`). A paid pull must leave the canister no poorer than
+/// it found it: it takes `price` in and spends execution (plus, for the signature,
+/// the threshold fee the management canister charges *us*). So the balance delta
+/// across the call has to be ≥ 0, and how much of `price` survived is the margin.
+///
+/// Until this existed, "`SIGN_PRICE` ≥ measured `sign_with_schnorr`" and
+/// "`ROOT_PRICE` ≥ two BLS pairings" were sentences in `cost.md` with nothing
+/// executing them: both prices are baked constants and a config edit that dropped
+/// either below cost would have gone green all the way to mainnet, where the
+/// symptom is a slow cycle leak, not a failure.
+///
+/// **What it is not:** a mainnet number. PocketIC runs a 13-node application
+/// subnet; the games live on a 34-node fiduciary one, where both execution and the
+/// threshold signature cost roughly 2.6× more. So this is a floor — it catches a
+/// price set below even the cheap subnet's cost, and a dependency bump that makes
+/// the pairings dramatically more expensive. The mainnet figure stays a cost-gate
+/// measurement (`07-build-plan §P8`), and the margin printed below is what that
+/// gate should be comparing against.
+fn assert_price_covers_the_work(what: &str, before: u128, after: u128, price: u128) {
+    let spent = price.saturating_sub(after.saturating_sub(before));
+    println!("[cost] {what}: charged {price}, spent {spent}, margin {} cycles", price.saturating_sub(spent));
+    assert!(
+        after >= before,
+        "{what} charged {price} cycles and left the canister {} poorer — the price \
+         no longer covers the work it triggers (spent ~{spent})",
+        before.saturating_sub(after)
+    );
+}
+
 /// `<message>\n---\npubkey: ..\nsignature: ..\n<extras>` (the shared wire format).
 fn signed_request(sk: &SigningKey, message: &str, extras: &[(&str, String)]) -> String {
     let pk = bs58::encode(sk.verifying_key().to_bytes()).into_string();
@@ -600,7 +630,34 @@ fn create_cancel_and_sign_a_real_verdict() {
         "no cached root → the boundary drops create_collection, it never executes"
     );
 
+    // And a `create` with **no witness at all** is refused for the same reason,
+    // which is the whole of the removed derivation echo (`P8`). It used to be
+    // admitted and answered `Derived` — zero writes, but a full replicated
+    // execution per copy, from a message the sender signs for themselves, i.e.
+    // free and unbounded. Asserted here rather than in the update, because the
+    // point is that it never reaches the update.
+    let no_witness = signed_request(
+        &recipient_sk,
+        &msg,
+        &extras
+            .iter()
+            .filter(|(k, _)| *k != "witness")
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        pic.update_call(
+            game,
+            anon(),
+            "create_collection",
+            Encode!(&no_witness).unwrap()
+        )
+        .is_err(),
+        "a proof-less create must die at the boundary, not execute replicated"
+    );
+
     // Paid root refresh through the proxy (ingress carries no cycles).
+    let before_root = pic.cycle_balance(game);
     let pr = relay(
         &pic,
         proxy,
@@ -615,6 +672,12 @@ fn create_cancel_and_sign_a_real_verdict() {
             CollectionResult::RootPushed
         ),
         "the index certificate authenticates a root"
+    );
+    assert_price_covers_the_work(
+        "push_root",
+        before_root,
+        pic.cycle_balance(game),
+        ROOT_PRICE,
     );
 
     // Create as a **direct ingress** — what a real recipient wallet sends. This is
@@ -643,10 +706,22 @@ fn create_cancel_and_sign_a_real_verdict() {
             Encode!(&collection_hex).unwrap(),
         )
         .expect("get_collection");
-    assert!(matches!(
-        Decode!(&cq, Option<CollectionStateView>).unwrap(),
-        Some(CollectionStateView::Funding)
-    ));
+    let view = Decode!(&cq, Option<conditional_funding::CollectionView>)
+        .unwrap()
+        .expect("the collection is materialized");
+    assert!(matches!(view.state, CollectionStateView::Funding));
+    // The window a donor has to size their escrow `deadline` against. Asserted
+    // because this is the *only* place it is published: `collection_id` is a hash,
+    // and every contribution after the one that materialized the collection joins
+    // by deriving the resolver, never presenting itself here (spec §Тайминги).
+    assert_eq!(view.created_at, created_at, "the birth slot, through the anchor");
+    assert_eq!(view.duration, duration);
+    assert_eq!(view.voting_period, VOTING_PERIOD);
+    assert_eq!(
+        view.recipient,
+        bs58::encode(recipient).into_string(),
+        "a contribution's escrow salt commits the recipient"
+    );
 
     // Recipient cancels → the collection is Decided{Refund} (all-or-nothing: the
     // whole set refunds).
@@ -669,6 +744,7 @@ fn create_cancel_and_sign_a_real_verdict() {
     );
 
     // Paid request_signature → a real threshold Ed25519 `Signed{Refund}` verdict.
+    let before_sign = pic.cycle_balance(game);
     let sr = relay(
         &pic,
         proxy,
@@ -685,6 +761,12 @@ fn create_cancel_and_sign_a_real_verdict() {
         }
         other => panic!("expected Signed{{Refund}}, got {other:?}"),
     };
+    assert_price_covers_the_work(
+        "request_signature",
+        before_sign,
+        pic.cycle_balance(game),
+        SIGN_PRICE,
+    );
 
     // The signature is a valid Ed25519 signature over the verdict message
     // `VERDICT_DOMAIN ‖ program_id(32) ‖ outcome` for the collection's resolver —
@@ -694,6 +776,8 @@ fn create_cancel_and_sign_a_real_verdict() {
     let mut verdict = b"crown:two-outcome:devnet".to_vec();
     verdict.extend_from_slice(&factory()); // program_id == crate::ID == config::FACTORY
     verdict.push(1u8); // refund
+    verdict.extend_from_slice(&FEE_BPS.to_le_bytes());
+    verdict.extend_from_slice(&fee_wallet());
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&resolver)
         .expect("resolver is a valid Ed25519 public key");
     let sig = ed25519_dalek::Signature::from_slice(&signature).expect("64-byte signature");
@@ -1079,9 +1163,10 @@ fn a_quorate_vote_decides_a_collection_both_ways() {
                 Encode!(collection_hex).unwrap(),
             )
             .expect("get_collection");
-        let got = Decode!(&cq, Option<CollectionStateView>)
+        let got = Decode!(&cq, Option<conditional_funding::CollectionView>)
             .unwrap()
-            .expect("the tally is lazy but total — reading past the window decides");
+            .expect("the tally is lazy but total — reading past the window decides")
+            .state;
         let decided_as_expected = matches!(
             (*outcome, got),
             (0, CollectionStateView::DecidedSettle) | (1, CollectionStateView::DecidedRefund)
@@ -1119,6 +1204,8 @@ fn a_quorate_vote_decides_a_collection_both_ways() {
         let mut verdict = b"crown:two-outcome:devnet".to_vec();
         verdict.extend_from_slice(&factory());
         verdict.push(*outcome);
+        verdict.extend_from_slice(&FEE_BPS.to_le_bytes());
+        verdict.extend_from_slice(&fee_wallet());
         let vk = ed25519_dalek::VerifyingKey::from_bytes(resolver)
             .expect("resolver is a valid Ed25519 public key");
         let sig = ed25519_dalek::Signature::from_slice(&signature).expect("64-byte signature");

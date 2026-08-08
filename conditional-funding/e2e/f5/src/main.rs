@@ -50,7 +50,7 @@
 use anchor_lang::{InstructionData, ToAccountMetas};
 use candid::{CandidType, Decode, Deserialize, Encode, Nat, Principal, Reserved};
 use conditional_funding::{
-    protocol, CollectionResult, CollectionStateView, InitArgs, SignatureView,
+    protocol, CollectionResult, CollectionStateView, CollectionView, InitArgs, SignatureView,
 };
 use ed25519_dalek::{Signer as DalekSigner, SigningKey};
 use pocket_ic::{PocketIc, PocketIcBuilder, Time};
@@ -74,8 +74,9 @@ use std::{error::Error, time::SystemTime};
 type R<T> = Result<T, Box<dyn Error>>;
 
 const URL: &str = "https://api.devnet.solana.com";
-/// 1 USDC per contribution — over the game floor (`min_gross` = 0.41) and the
-/// index dust floor (0.20), and small enough that a run costs little.
+/// 0.25 USDC per contribution — exactly the devnet game floor (`min_gross` =
+/// 250_000) and, after the 3% fee, still over the index dust floor (0.2425 ≥
+/// 0.20), so a run costs cents. The mainnet floor is 2_200_000 (`cost.md §5`).
 const GROSS: u64 = 250_000;
 /// Contributions per collection. Two is the smallest N that can show the thing
 /// worth showing: the second escrow redeems a signature it never paid for.
@@ -273,6 +274,11 @@ enum IngestResult {
     Duplicate,
     NotFound,
     AfterCutover,
+    /// The settlement's payer is an escrow whose birth the index has not folded
+    /// yet — nothing is folded and the signature stays free. Fold the escrow's
+    /// `create_escrow` transaction first, then submit this one again
+    /// (`crown-indexer/src/state.rs::attributable`).
+    UnknownBirth,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -886,10 +892,14 @@ fn main() -> R<()> {
     // is exactly why one signature settles them all.
     //
     // The *book* is per-escrow. Attribution reads `escrow → donor` from the births
-    // (`00 §4`), so a settlement paid by an escrow the index never saw is credited
-    // to the escrow address instead of the human who funded it — silently and
-    // permanently. So every contribution whose settlement should count needs its
-    // own ingest, bought by whoever wants the reputation (`cost.md §8`).
+    // (`00 §4`), so every contribution whose settlement should count needs its own
+    // ingest. Getting the order wrong is no longer silent: a settlement paid by an
+    // escrow the index has never seen born is refused outright (`UnknownBirth`,
+    // nothing folded, signature still free — `crown-indexer/src/state.rs::
+    // attributable`), because folding it would credit the escrow *address* forever.
+    // So this step is not merely tidy ordering — it is what lets step [12] fold at
+    // all, and doing it here rather than at claim time is the rule the shop front
+    // owes its contributors (`00 §5`).
     println!("\n[6] index: fold every contribution's birth");
     for col in &collections {
         for c in &col.contributions {
@@ -969,7 +979,7 @@ fn main() -> R<()> {
             .query_call(game, anon(), "get_collection", Encode!(&col.id_hex)?)
             .map_err(|e| format!("get_collection: {e:?}"))?;
         if !matches!(
-            Decode!(&gq, Option<CollectionStateView>)?,
+            Decode!(&gq, Option<CollectionView>)?.map(|v| v.state),
             Some(CollectionStateView::Funding)
         ) {
             return Err("the collection is not in Funding after materialization".into());
@@ -1065,6 +1075,8 @@ fn main() -> R<()> {
         let mut verdict = cfg.domain.as_bytes().to_vec();
         verdict.extend_from_slice(&cfg.factory);
         verdict.push(expected);
+        verdict.extend_from_slice(&cfg.fee_bps.to_le_bytes());
+        verdict.extend_from_slice(&cfg.fee_wallet);
         let vk = ed25519_dalek::VerifyingKey::from_bytes(&col.resolver)?;
         let sig = ed25519_dalek::Signature::from_slice(&signature)?;
         vk.verify_strict(&verdict, &sig)
@@ -1133,6 +1145,8 @@ fn main() -> R<()> {
         let mut verdict = cfg.domain.as_bytes().to_vec();
         verdict.extend_from_slice(&cfg.factory);
         verdict.push(outcome);
+        verdict.extend_from_slice(&cfg.fee_bps.to_le_bytes());
+        verdict.extend_from_slice(&cfg.fee_wallet);
         for c in &col.contributions {
             let claim_ix = Instruction {
                 program_id: two_outcome::ID,
@@ -1228,10 +1242,11 @@ fn main() -> R<()> {
     if after != expected {
         return Err(format!("reputation is {after}, expected {expected}").into());
     }
-    // …and not to the escrow addresses, which is the silent, permanent failure
-    // mode an index missing a birth falls into (`00 §4`). Both contributions
-    // settle, and both are credited to the human — that only holds because step 6
-    // folded a birth for each, not just for the one the game was shown.
+    // …and not to the escrow addresses. Both contributions settle and both are
+    // credited to the human — which holds because step [6] folded a birth for each,
+    // not just for the one the game was shown. Had it not, these ingests would have
+    // answered `UnknownBirth` and folded nothing, rather than quietly crediting an
+    // address nobody holds a key to (`00 §5`).
     for c in &collections[0].contributions {
         let (at_escrow, _) = reputation(&pic, index, &chain, &c.escrow.to_bytes(), &recipient)?;
         if at_escrow != 0 {

@@ -24,8 +24,35 @@ pub enum RegError {
     TimeOverflow,
 }
 
+/// The half of the registration policy that does **not** read the clock: the
+/// game floor and the duration range, in the spec order (floor first — it is the
+/// cheapest refusal, so a doomed dust call does no more work than it must).
+///
+/// Split out so the boundary can run it (harness §6). Both refusals are permanent
+/// facts about an escrow that already exists on chain: `gross` and `duration` are
+/// committed by `task_id`, the escrow is immutable, and no passage of time turns
+/// either into an acceptance. Left to the update, one such registration was a
+/// **flood template** — it never materializes, so `is_materialized` never starts
+/// refusing it at the boundary, and the signed half of a request carries no nonce,
+/// so a single doomed message is replayable forever and executed replicated every
+/// time. `conditional-funding` already checked both at its boundary; the reference
+/// game did not (`P8`).
+///
+/// The deadline check is the genuinely time-dependent one and stays in the update.
+pub fn validate_time_free(game_floor: u64, gross: u64, duration: i64) -> Result<(), RegError> {
+    if gross < game_floor {
+        return Err(RegError::GrossBelowFloor);
+    }
+    if !(MIN_DURATION..=MAX_DURATION).contains(&duration) {
+        return Err(RegError::DurationOutOfRange);
+    }
+    Ok(())
+}
+
 /// Validate a registration against the game floor and the timeline, in the spec
-/// order: floor → duration → deadline.
+/// order: floor → duration → deadline. Authoritative; the boundary runs the
+/// time-free prefix ([`validate_time_free`]) of exactly this, never a second copy
+/// of it.
 ///
 /// Every check here is a platform invariant, not a recipient preference. The
 /// recipient's own terms (a minimum, a "not accepting", a reputation bar) are a
@@ -34,12 +61,7 @@ pub enum RegError {
 /// the donor and protects no one (`P7.14`; the remedy for an unwanted task is
 /// `decline`, or the deadline's `refund()`).
 pub fn validate_registration(game_floor: u64, inp: &RegInputs) -> Result<(), RegError> {
-    if inp.gross < game_floor {
-        return Err(RegError::GrossBelowFloor);
-    }
-    if inp.duration < MIN_DURATION || inp.duration > MAX_DURATION {
-        return Err(RegError::DurationOutOfRange);
-    }
+    validate_time_free(game_floor, inp.gross, inp.duration)?;
     // deadline >= now + duration + voting_period + DEADLINE_MARGIN.
     let min_deadline = inp
         .now
@@ -140,6 +162,76 @@ mod tests {
         assert_eq!(
             validate_registration(FLOOR, &tight),
             Err(RegError::DeadlineTooTight)
+        );
+    }
+
+    /// The boundary runs `validate_time_free` and the update runs the whole
+    /// thing, so the two must agree the way `State::admits` agrees with
+    /// `apply_action`: every refusal the boundary makes is one the update makes
+    /// too, and the boundary never refuses what the update would accept. Drift
+    /// here is silent in both directions — a lost `false` is a flood template
+    /// back, a spurious `false` is a valid registration dropped with no reason
+    /// given to the client.
+    #[test]
+    fn the_time_free_prefix_agrees_with_the_full_check() {
+        let now = 1_000;
+        let cases = [
+            (FLOOR, 600),                  // fine
+            (FLOOR - 1, 600),              // below the floor
+            (0, 600),                      // far below
+            (FLOOR, MIN_DURATION - 1),     // duration too short
+            (FLOOR, MAX_DURATION + 1),     // duration too long
+            (FLOOR - 1, MAX_DURATION + 1), // both, floor reported first
+            (FLOOR, MIN_DURATION),         // exact edges
+            (FLOOR, MAX_DURATION),
+        ];
+        for (gross, duration) in cases {
+            // A deadline generous enough that only the time-free half can fail.
+            let inp = RegInputs {
+                gross,
+                duration,
+                deadline: tight_deadline(now, duration.max(0)),
+                voting_period: VP,
+                now,
+            };
+            let prefix = validate_time_free(FLOOR, gross, duration);
+            let full = validate_registration(FLOOR, &inp);
+            match prefix {
+                Err(e) => assert_eq!(
+                    full,
+                    Err(e),
+                    "boundary refused ({gross}, {duration}) with {e:?}; the update must too"
+                ),
+                Ok(()) => assert_eq!(
+                    full,
+                    Ok(()),
+                    "boundary admitted ({gross}, {duration}) the update then refused"
+                ),
+            }
+        }
+    }
+
+    /// …and the one refusal the boundary is *not* allowed to make, because time
+    /// can undo it: a deadline is tight relative to `now`, and `now` moves.
+    #[test]
+    fn the_time_free_prefix_says_nothing_about_the_deadline() {
+        let now = 1_000;
+        let duration = 600;
+        let inp = RegInputs {
+            gross: FLOOR,
+            duration,
+            deadline: tight_deadline(now, duration) - 1,
+            voting_period: VP,
+            now,
+        };
+        assert_eq!(
+            validate_registration(FLOOR, &inp),
+            Err(RegError::DeadlineTooTight)
+        );
+        assert_eq!(
+            validate_time_free(FLOOR, inp.gross, inp.duration),
+            Ok(()),
+            "the boundary is clock-free and must not pre-judge the deadline"
         );
     }
 

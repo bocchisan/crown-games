@@ -169,14 +169,46 @@ pub fn add_vote(
     })
 }
 
-/// The materialized collection's state (with accrued time transitions applied at
-/// `now` via a `Tick`), or `None` if unknown.
-pub fn collection_state(collection_id: &[u8; 32], now: u64) -> Option<State> {
+/// A materialized collection as `get_collection` reads it: the state at `now`
+/// plus the window this collection actually runs on.
+///
+/// The anchors are here because a donor needs them and has nowhere else to get
+/// them. A contribution's escrow must be born with
+/// `deadline >= created_at + duration + voting_period + DEADLINE_MARGIN` — the
+/// spec assigns that arithmetic to the donor's client, and the canister checks it
+/// only for the one contribution that materialized the collection; every later
+/// one is a member by deriving the resolver and is never seen here. Until these
+/// fields were published the client had to *guess* `created_at`: `collection_id`
+/// is a hash, so the recipient and the window are not recoverable from it, and a
+/// guess that lands early makes the escrow refundable before the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View {
+    pub state: State,
+    pub created_at: u64,
+    pub duration: u64,
+    pub voting_period: u64,
+    pub recipient: [u8; 32],
+}
+
+/// The materialized collection (with accrued time transitions applied at `now`
+/// via a `Tick`), or `None` if unknown.
+pub fn collection_view(collection_id: &[u8; 32], now: u64) -> Option<View> {
     COLLECTIONS.with_borrow_mut(|c| {
         let s = c.get_mut(collection_id)?;
         let _ = step(&mut s.collection, Action::Tick, now); // apply accrued transitions
-        Some(s.collection.state)
+        Some(View {
+            state: s.collection.state,
+            created_at: s.collection.created_at,
+            duration: s.collection.duration,
+            voting_period: s.collection.voting_period,
+            recipient: s.recipient,
+        })
     })
+}
+
+/// The materialized collection's state alone (same lazy `Tick`).
+pub fn collection_state(collection_id: &[u8; 32], now: u64) -> Option<State> {
+    collection_view(collection_id, now).map(|v| v.state)
 }
 
 /// The terminal outcome of a collection, or `None` if not yet `Decided`.

@@ -280,7 +280,7 @@ fn queries_wire_through() {
         )
         .expect("get_collection");
     assert!(
-        Decode!(&g, Option<conditional_funding::CollectionStateView>)
+        Decode!(&g, Option<conditional_funding::CollectionView>)
             .unwrap()
             .is_none()
     );

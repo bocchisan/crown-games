@@ -46,24 +46,23 @@ pub fn remember(roots: &mut Vec<[u8; 32]>, root: [u8; 32]) {
     roots.push(root);
 }
 
-/// The birth of `escrow` proven by `witness_cbor` against any cached root,
-/// with the root it verified under.
-///
-/// The caller gets the matched root back so a second witness in the same request
-/// (the registrant's reputation) is checked against the *same* root: two proofs
-/// admitted under two different roots would mix two book states.
+/// The birth of `escrow` proven by `witness_cbor` against any cached root.
 ///
 /// Newest root first — the common case is the freshest one. A witness
 /// reconstructs to exactly one root, so at most one can match.
-pub fn birth(
-    roots: &[[u8; 32]],
-    witness_cbor: &[u8],
-    escrow: &[u8; 32],
-) -> Option<([u8; 32], Birth)> {
+///
+/// The matched root used to come back too, so a second witness in the same
+/// request (the registrant's reputation) could be checked against the *same*
+/// root rather than a different one — two proofs under two roots would mix two
+/// book states. That second witness is gone with the recipient profile
+/// (`P7.14`): registration carries exactly one proof, and the vote's weight
+/// witness rides its own request. All three games were already discarding the
+/// root (`let Some((_, b))`), so the return value was a rationale with no reader.
+pub fn birth(roots: &[[u8; 32]], witness_cbor: &[u8], escrow: &[u8; 32]) -> Option<Birth> {
     roots
         .iter()
         .rev()
-        .find_map(|root| birth_from_witness(witness_cbor, root, escrow).map(|b| (*root, b)))
+        .find_map(|root| birth_from_witness(witness_cbor, root, escrow))
 }
 
 /// Reputation for `(chain, donor, recipient)` proven by `witness_cbor` against
@@ -172,6 +171,28 @@ mod tests {
     /// one is ever needed, is not a bigger cache: raising `ROOT_CACHE` widens the
     /// window in which a since-corrected book state stays provable, at exactly the
     /// same rate.
+    ///
+    /// **And that deliberate case has a price, which is the part worth writing
+    /// down.** Replays are the cheap source of *distinct* roots: historical
+    /// certificates of the index are free to fetch (`get_certificate` is a
+    /// `query`) and every past root is a different 32 bytes, so `ROOT_CACHE`
+    /// pushes evict whatever the honest client just paid to install — at
+    /// `ROOT_CACHE · ROOT_PRICE` ≈ $0.008 on mainnet per eviction round. Sustained
+    /// against a live game that is on the order of $300/day to keep **every**
+    /// birth and vote proof failing at the boundary, silently and with no reason
+    /// given to the caller (`inspect_message` drops, it does not answer). Not an
+    /// exposure of money — of liveness; and games are not frozen, so it is
+    /// fixable, but only before the canister carries live scopes
+    /// (`08-deferred.md §Ширина кеша корней`, `cost.md §6` #11).
+    ///
+    /// The shape of the fix is decided and deliberately **not** built yet: store
+    /// `(root, cert_time)` and require a *new* root's `/time` to exceed the
+    /// newest cached one, leaving a re-push of an already-cached root the free
+    /// refresh it is today. That makes replays unable to evict — distinct roots
+    /// would then require the index's root to genuinely move, i.e. one paid
+    /// `ingest` each, ~12× the price. It is not built because it needs `/time` to
+    /// be present in `data_certificate()` verified on a live IC, not assumed: a
+    /// wrong assumption here fails **closed** and bricks every proof in the game.
     #[test]
     fn measure_how_many_pushes_a_proof_survives() {
         let escrow = [5u8; 32];
@@ -233,8 +254,7 @@ mod tests {
         for i in 0..3u8 {
             remember(&mut roots, [i; 32]);
         }
-        let (matched, b) = birth(&roots, &birth_cbor, &escrow).expect("proven");
-        assert_eq!(matched, root);
+        let b = birth(&roots, &birth_cbor, &escrow).expect("proven");
         assert_eq!(b.donor, [1u8; 32]);
         assert_eq!(b.slot, 42);
     }

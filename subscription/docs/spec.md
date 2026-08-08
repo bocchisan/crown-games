@@ -49,7 +49,7 @@ release(k) валиден ⇔ now ≥ due(t0, period, k)  // границы вк
 
 На `release(k)`:
 - `piece_j = chunk · share_j / 10000` (пол); `fee_j = piece_j · fee_bps / 10000` (пол).
-- `splitter.donate(recipient_j, piece_j − fee_j)` (CPI, authority — PDA) → `Settled(payer=escrow)` →
+- `splitter.donate(recipient_j, piece_j − fee_j)` (CPI, authority — PDA) → `Settled(donor=escrow)` →
   **репутация донору**.
 - Σ комиссий строки — **одним** переводом на ATA `fee_wallet` (мимо сплиттера, без события/репутации).
 - «Пыль» `chunk − Σ piece_j` → донору, без комиссии.

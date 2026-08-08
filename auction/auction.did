@@ -65,6 +65,16 @@ type SignatureView = record { signature : blob; outcome : nat8 };
 service : (opt InitArgs) -> {
   accept_lot : (text) -> (AuctionResult);
   // One-time idempotent fetch of the threshold master public key.
+  // **Rate-limited rather than latched, and the difference is the whole design.**
+  // The key only lands *after* the `await`, so until it does, `MASTER` is still
+  // empty and every concurrent caller passes the check below — anonymous, unpaid,
+  // one management call each. The obvious fix is the claim-before-`await` that
+  // `signing` uses; here it would be a bug. A claim taken before the `await`
+  // survives a trapped callback, and this claim is not per-scope but per-canister:
+  // one stuck flag and the game can never take its key, i.e. no resolver is ever
+  // derivable and every escrow of every scope is left to `refund()`. So the gate is
+  // a timestamp instead: it bounds the flood to one attempt per window and **heals
+  // by itself**, because time passes whatever happened to the callback.
   bootstrap : () -> (AuctionResult);
   cancel_auction : (text) -> (AuctionResult);
   get_auction : (text) -> (opt AuctionStateView) query;

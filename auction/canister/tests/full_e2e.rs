@@ -25,8 +25,12 @@ use solana_sdk::{
 };
 
 const GAME_WASM: &str = "../target/e2e/wasm32-unknown-unknown/release/auction.wasm";
-// The platform floor (`config::MIN_ENTRY`); an auction may raise it, never lower
-// it, and it enters `auction_id`.
+// **This auction's own `min_entry`** — a preimage field of `auction_id`, not the
+// platform floor. The platform floor is `config::MIN_ENTRY` (`250_000` on the
+// devnet profile), and the effective floor is `max(min_entry, MIN_ENTRY)`: a
+// creator's field may only raise it. Named after neither on purpose, so the two
+// do not get confused again — a test constant that mirrors baked config silently
+// stops mirroring it when the config moves.
 const MIN_ENTRY: u64 = 1_860_000;
 // The fee is the game's price list, not a request field (harness §9): the escrow
 // must be born with exactly these or it derives to a different address.
@@ -192,6 +196,38 @@ struct CompiledInstruction {
 struct LoadedAddresses {
     writable: Vec<String>,
     readonly: Vec<String>,
+}
+
+/// Non-negativity, **measured rather than promised** (`cost.md §6`,
+/// `01-standards §Тесты 4,12`). A paid pull must leave the canister no poorer than
+/// it found it: it takes `price` in and spends execution (plus, for the signature,
+/// the threshold fee the management canister charges *us*). So the balance delta
+/// across the call has to be >= 0, and what is left of `price` is the margin.
+///
+/// Until this existed, "`SIGN_PRICE` >= measured `sign_with_schnorr`" and
+/// "`ROOT_PRICE` >= two BLS pairings" were sentences in `cost.md` with nothing
+/// executing them: both are baked constants, and a config edit that dropped either
+/// below cost would have gone green all the way to mainnet, where the symptom is a
+/// slow cycle leak rather than a failure.
+///
+/// **What it is not:** a mainnet number. PocketIC runs a 13-node application
+/// subnet; the games live on a 34-node fiduciary one, where execution and the
+/// threshold signature cost roughly 2.6x more. So this is a floor — it catches a
+/// price set below even the cheap subnet's cost. The mainnet figure stays a
+/// cost-gate measurement (`07-build-plan §P8`), and the margin printed here is
+/// what that gate compares against.
+fn assert_price_covers_the_work(what: &str, before: u128, after: u128, price: u128) {
+    let spent = price.saturating_sub(after.saturating_sub(before));
+    println!(
+        "[cost] {what}: charged {price}, spent {spent}, margin {} cycles",
+        price.saturating_sub(spent)
+    );
+    assert!(
+        after >= before,
+        "{what} charged {price} cycles and left the canister {} poorer — the price \
+         no longer covers the work it triggers (spent ~{spent})",
+        before.saturating_sub(after)
+    );
 }
 
 fn build(dir: &str, extra: &[&str]) {
@@ -527,6 +563,7 @@ fn register_cancel_and_sign_a_real_verdict() {
     );
 
     // Paid root refresh through the proxy (ingress carries no cycles).
+    let before_root = pic.cycle_balance(game);
     let pr = relay(
         &pic,
         proxy,
@@ -542,6 +579,7 @@ fn register_cancel_and_sign_a_real_verdict() {
         ),
         "the index certificate authenticates a root"
     );
+    assert_price_covers_the_work("push_root", before_root, pic.cycle_balance(game), ROOT_PRICE);
 
     // Register as a **direct ingress** — what a real donor wallet sends. This is
     // the boundary contract: with the certificate's BLS moved to `push_root`, the
@@ -592,6 +630,7 @@ fn register_cancel_and_sign_a_real_verdict() {
     // Paid request_signature → a real threshold Ed25519 `Signed{Cancel}` verdict,
     // under the entry's own leaf scope.
     let escrow_b58 = bs58::encode(escrow_arr).into_string();
+    let before_sign = pic.cycle_balance(game);
     let sr = relay(
         &pic,
         proxy,
@@ -608,6 +647,12 @@ fn register_cancel_and_sign_a_real_verdict() {
         }
         other => panic!("expected Signed{{Cancel}}, got {other:?}"),
     };
+    assert_price_covers_the_work(
+        "request_signature",
+        before_sign,
+        pic.cycle_balance(game),
+        SIGN_PRICE,
+    );
 
     // The signature is a valid Ed25519 signature over the verdict message
     // `VERDICT_DOMAIN ‖ program_id(32) ‖ outcome` for **this entry's** resolver —
@@ -618,6 +663,8 @@ fn register_cancel_and_sign_a_real_verdict() {
     let mut verdict = b"crown:two-outcome:devnet".to_vec();
     verdict.extend_from_slice(&factory()); // program_id == crate::ID == config::FACTORY
     verdict.push(1u8); // cancel
+    verdict.extend_from_slice(&FEE_BPS.to_le_bytes());
+    verdict.extend_from_slice(&fee_wallet());
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&resolver)
         .expect("resolver is a valid Ed25519 public key");
     let sig = ed25519_dalek::Signature::from_slice(&signature).expect("64-byte signature");

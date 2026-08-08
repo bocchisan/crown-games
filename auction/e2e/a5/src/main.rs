@@ -259,6 +259,11 @@ enum IngestResult {
     Duplicate,
     NotFound,
     AfterCutover,
+    /// The settlement's payer is an escrow whose birth the index has not folded
+    /// yet — nothing is folded and the signature stays free. Fold the escrow's
+    /// `create_escrow` transaction first, then submit this one again
+    /// (`crown-indexer/src/state.rs::attributable`).
+    UnknownBirth,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -993,6 +998,8 @@ fn main() -> R<()> {
                 let mut verdict = cfg.domain.as_bytes().to_vec();
                 verdict.extend_from_slice(&cfg.factory);
                 verdict.push(outcome);
+                verdict.extend_from_slice(&cfg.fee_bps.to_le_bytes());
+                verdict.extend_from_slice(&cfg.fee_wallet);
                 let vk = ed25519_dalek::VerifyingKey::from_bytes(&e.resolver)?;
                 let sig = ed25519_dalek::Signature::from_slice(&signature)?;
                 vk.verify_strict(&verdict, &sig).map_err(|_| {
@@ -1033,6 +1040,8 @@ fn main() -> R<()> {
         let mut verdict = cfg.domain.as_bytes().to_vec();
         verdict.extend_from_slice(&cfg.factory);
         verdict.push(outcome);
+        verdict.extend_from_slice(&cfg.fee_bps.to_le_bytes());
+        verdict.extend_from_slice(&cfg.fee_wallet);
         let claim_ix = Instruction {
             program_id: two_outcome::ID,
             accounts: two_outcome::accounts::Claim {

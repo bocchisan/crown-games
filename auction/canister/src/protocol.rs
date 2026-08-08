@@ -6,9 +6,10 @@
 
 use sha2::{Digest, Sha256};
 
-// The verdict message (`domain ‖ program_id(32) ‖ u8(outcome)`) and the wallet
-// signature check are identical across every `two-outcome` game — reused from
-// `crown-games-common` so `protocol::verify` / `protocol::verdict_message` stay put.
+// The verdict message (`domain ‖ program_id(32) ‖ u8(outcome) ‖ u16le(fee_bps) ‖
+// fee_wallet(32)`) and the wallet signature check are identical across every
+// `two-outcome` game — reused from `crown-games-common` so `protocol::verify` /
+// `protocol::verdict_message` stay put.
 pub use crown_games_common::wallet::{verdict_message, verify};
 
 /// Domain of the wallet-signed messages.

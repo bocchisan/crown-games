@@ -165,6 +165,11 @@ enum IngestResult {
     Duplicate,
     NotFound,
     AfterCutover,
+    /// The settlement's payer is an escrow whose birth the index has not folded
+    /// yet — nothing is folded and the signature stays free. Fold the escrow's
+    /// `create_escrow` transaction first, then submit this one again
+    /// (`crown-indexer/src/state.rs::attributable`).
+    UnknownBirth,
 }
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
@@ -642,9 +647,13 @@ fn main() -> R<()> {
         ],
     )?;
 
+    // The escrow's own fee fields close the message: a verdict signed for this
+    // scope opens only escrows born with this game's price list (harness §9).
     let mut verdict = b"crown:two-outcome:devnet".to_vec();
     verdict.extend_from_slice(&two_outcome::ID.to_bytes());
     verdict.push(CANCEL);
+    verdict.extend_from_slice(&FEE_BPS.to_le_bytes());
+    verdict.extend_from_slice(&fee_wallet);
     let claim_ix = Instruction {
         program_id: two_outcome::ID,
         accounts: two_outcome::accounts::Claim {

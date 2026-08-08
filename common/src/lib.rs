@@ -1,4 +1,24 @@
 #![forbid(unsafe_code)]
+// The ban is a crate lint, not a habit — the same one `crown-reduce`, the index
+// and each game's `logic/` already carry, and this crate had the weakest claim to
+// being without it: it is the half that reads **hostile bytes**. Every public
+// verifier here (`request::parse`, `field::hex_*`, `birth_from_witness`,
+// `certified_root`) is handed attacker-chosen input on the anonymous boundary, so
+// a panic is a denial of service and an unmarked overflow is a wrong weight. The
+// behaviour was already right (`birth::malformed_bytes_never_panic` pins it); what
+// was missing is the compiler refusing the next line that isn't. Tests are exempt —
+// `unwrap` in a test *is* the assertion — and so is `config_bake`, which runs in
+// `build.rs`, where a panic is a failed build rather than a wedged canister.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing
+    )
+)]
 //! `crown-games-common` — the delicate, game-agnostic crypto shared by every
 //! class-B game canister on the `two-outcome` form:
 //!

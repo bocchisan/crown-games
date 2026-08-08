@@ -13,7 +13,7 @@ mod tests {
         assert_eq!(CROWN_INDEX, "aaaaa-aa");
         assert_eq!(THRESHOLD_KEY, "key_1");
         assert_eq!(VOTING_PERIOD, 120);
-        assert_eq!(MIN_GROSS, 1_860_000);
+        assert_eq!(MIN_GROSS, 250_000);
         assert_eq!(SIGN_PRICE, 26_200_000_000);
         assert_eq!(ROOT_PRICE, 1_000_000_000);
         assert_eq!(FEE_BPS, 300);

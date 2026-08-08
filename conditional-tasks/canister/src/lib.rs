@@ -1,3 +1,21 @@
+#![forbid(unsafe_code)]
+// The same crate-level ban `crown-reduce`, the index and this game's `logic/`
+// already carry, extended to the canister — the half that actually reads hostile
+// bytes. Every state-changing method takes an attacker-chosen `text` and runs it
+// twice: once non-replicated on the anonymous boundary and once replicated. A
+// panic on either is a denial of service that costs the sender nothing, and an
+// unmarked overflow is a wrong verdict. Tests are exempt — `unwrap` in a test *is*
+// the assertion.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing
+    )
+)]
 //! conditional-tasks canister — the reference class-B game. Blind (no chain
 //! reads); `task_id` is a free `scope_id`, 1:1 to a single escrow (`B=1`).
 //!
@@ -39,6 +57,9 @@ pub use crown_games_common::{
 thread_local! {
     /// Cached threshold master (public key + chain code); resolvers derive from it.
     static MASTER: RefCell<Option<([u8; 32], [u8; 32])>> = const { RefCell::new(None) };
+    /// Unix seconds of the last `bootstrap` attempt (0 = none). A timestamp, not
+    /// a latch — see `bootstrap`.
+    static LAST_BOOTSTRAP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// crown-indexer principal (birth proofs are keyed to it).
     static INDEX: RefCell<Principal> = const { RefCell::new(Principal::anonymous()) };
     /// NNS root key that authenticates the index's certificate (blind proof).
@@ -150,10 +171,23 @@ fn init(overrides: Option<InitArgs>) {
 /// Fetch and cache the threshold master public key (one-time, idempotent). Must
 /// run after deploy before donors can query resolvers. `init` cannot (it is
 /// sync) and timers are barred, so this is an explicit setup call.
+/// **Rate-limited rather than latched, and the difference is the whole design.**
+/// The key only lands *after* the `await`, so until it does, `MASTER` is still
+/// empty and every concurrent caller passes the check below — anonymous, unpaid,
+/// one management call each. The obvious fix is the claim-before-`await` that
+/// `signing` uses; here it would be a bug. A claim taken before the `await`
+/// survives a trapped callback, and this claim is not per-scope but per-canister:
+/// one stuck flag and the game can never take its key, i.e. no resolver is ever
+/// derivable and every escrow of every scope is left to `refund()`. So the gate is
+/// a timestamp instead: it bounds the flood to one attempt per window and **heals
+/// by itself**, because time passes whatever happened to the callback.
 #[ic_cdk::update]
 async fn bootstrap() -> TaskResult {
     if MASTER.with_borrow(|m| m.is_some()) {
         return TaskResult::KeyBootstrapped;
+    }
+    if !claim_bootstrap_window(bootstrap_now()) {
+        return TaskResult::NotBootstrapped;
     }
     let arg = SchnorrPublicKeyArgs {
         canister_id: None,
@@ -257,7 +291,17 @@ fn inspect_message() {
     // `bootstrap` carries no `text` and is a one-shot fetch — admit only until
     // the master key lands, so a repeat is dropped for free.
     if method == "bootstrap" {
-        if MASTER.with_borrow(|m| m.is_none()) {
+        // Admitted only while the key is missing **and** no recent attempt still
+        // holds the window (`bootstrap`), so a burst is dropped free instead of
+        // executing replicated. Read-only: the window is *taken* by the update,
+        // never here — the boundary must not consume what it only inspects.
+        //
+        // Unlike the state checks in `admit_*`, this refusal is one time undoes
+        // (the window reopens). That is fine for the method it guards and only
+        // for it: `bootstrap` is an operator call with no deadline, retried
+        // seconds later at no cost, and never on a user's critical path.
+        let free = LAST_BOOTSTRAP.with(|t| bootstrap_window_free(t.get(), bootstrap_now()));
+        if free && MASTER.with_borrow(|m| m.is_none()) {
             ic_cdk::api::accept_message();
         }
         return;
@@ -288,6 +332,15 @@ fn inspect_message() {
 /// (`01-standards §Тесты 4`).
 #[ic_cdk::update]
 fn push_root(cert: Vec<u8>) -> TaskResult {
+    // `MAX_ARG_BYTES` lives in `inspect_message`, which **inter-canister calls do
+    // not run** — and this method is only ever reached that way. Re-asserted here
+    // for the same reason the relay re-asserts it on its own replicated path: the
+    // cap is a cost knob (harness §6), and without it one caller can hand this
+    // canister a multi-megabyte blob to CBOR-decode. Cheapest possible check, so
+    // it goes ahead of the payment one.
+    if cert.len() > MAX_ARG_BYTES {
+        return TaskResult::Malformed;
+    }
     if ic_cdk::api::msg_cycles_available() < config::ROOT_PRICE {
         return TaskResult::Underpaid;
     }
@@ -319,6 +372,11 @@ async fn request_signature(chain: String, task: String) -> TaskResult {
     if chain != config::CHAIN_ID {
         return TaskResult::WrongTarget;
     }
+    // Same reason as `push_root`: no `inspect_message` on the inter-canister path.
+    // A `task` is 32 bytes in base58 and nothing else, so bound it before decoding.
+    if task.len() > MAX_ARG_BYTES {
+        return TaskResult::Malformed;
+    }
     let Some(task_id) = bs58_array::<32>(&task) else {
         return TaskResult::Malformed;
     };
@@ -345,7 +403,16 @@ async fn request_signature(chain: String, task: String) -> TaskResult {
     // Payment accepted only now, before the (paid) threshold signature.
     ic_cdk::api::msg_cycles_accept(config::SIGN_PRICE);
     let arg = SignWithSchnorrArgs {
-        message: protocol::verdict_message(config::DOMAIN, &config::FACTORY, outcome),
+        // The consumer's own price list rides in the signed message, so the
+        // signature cannot open an escrow that joined this scope by deriving the
+        // resolver and set its own fee (`crown-games-common::wallet`, harness §9).
+        message: protocol::verdict_message(
+            config::DOMAIN,
+            &config::FACTORY,
+            outcome,
+            config::FEE_BPS,
+            &config::FEE_WALLET,
+        ),
         derivation_path: vec![task_id.to_vec()],
         key_id: SchnorrKeyId {
             algorithm: SchnorrAlgorithm::Ed25519,
@@ -465,7 +532,7 @@ fn admit_register(text: &str) -> Result<Registered, TaskResult> {
     let Some((master_pk, chain_code)) = MASTER.with_borrow(|m| *m) else {
         return Err(TaskResult::NotBootstrapped);
     };
-    let Some(req) = request::parse(text) else {
+    let Some(req) = request::parse(text, protocol::DOMAIN) else {
         return Err(TaskResult::Malformed);
     };
     if req.signed("action") != Some("register") || !target_ok(&req) {
@@ -488,6 +555,21 @@ fn admit_register(text: &str) -> Result<Registered, TaskResult> {
     ) else {
         return Err(TaskResult::Malformed);
     };
+
+    // The clock-free half of the registration policy, run here and not only in
+    // the update (harness §6). Both refusals are permanent — `gross` and
+    // `duration` are committed by `task_id` against an escrow that already exists
+    // and cannot change — so no passage of time turns either into an acceptance,
+    // which is exactly the condition for refusing at the boundary. Left to the
+    // update they were a flood template: such a registration never materializes,
+    // so `is_materialized` below never begins to refuse it, and the signed half of
+    // a request carries no nonce — one doomed message replays forever and is
+    // executed replicated every time. First, because it is the cheapest refusal
+    // there is: ahead of the `task_id` hash, the resolver derivation and the
+    // witness walk. `validate_registration` in the update stays authoritative.
+    if let Err(e) = validate::validate_time_free(config::MIN_GROSS, gross, duration) {
+        return Err(reg_error(e));
+    }
 
     // Fee is the game's price list, not an argument (harness §9): `FEE_BPS` /
     // `FEE_WALLET` come from config. Taking them from the request would be a
@@ -541,7 +623,7 @@ fn admit_register(text: &str) -> Result<Registered, TaskResult> {
     // already-authenticated index root (`push_root` did the BLS, paid). A pure
     // hash-tree walk, O(log n) — it fits the `inspect_message` budget, which the
     // certificate's pairings do not (`push_root`).
-    let Some((_root, b)) = ROOTS.with_borrow(|cache| roots::birth(cache, &witness, &address))
+    let Some(b) = ROOTS.with_borrow(|cache| roots::birth(cache, &witness, &address))
     else {
         return Err(TaskResult::BadBirthProof);
     };
@@ -584,7 +666,7 @@ fn admit_action(
     action_name: &str,
     action: &Action,
 ) -> Result<([u8; 32], [u8; 32]), TaskResult> {
-    let Some(req) = request::parse(text) else {
+    let Some(req) = request::parse(text, protocol::DOMAIN) else {
         return Err(TaskResult::Malformed);
     };
     if req.signed("action") != Some(action_name) || !target_ok(&req) {
@@ -602,7 +684,7 @@ fn admit_action(
 /// Admit a `vote`: signature + target + the weight proof meets `MIN_VOTE_WEIGHT`.
 /// Returns `(task_id, vote)`; `state::add_vote` applies the dedup + `V_MAX` cap.
 fn admit_vote(text: &str) -> Result<([u8; 32], conditional_tasks_logic::Vote), TaskResult> {
-    let Some(req) = request::parse(text) else {
+    let Some(req) = request::parse(text, protocol::DOMAIN) else {
         return Err(TaskResult::Malformed);
     };
     if req.signed("action") != Some("vote") || !target_ok(&req) {
@@ -700,4 +782,68 @@ fn state_error(e: state::StateError) -> TaskResult {
     }
 }
 
+/// Seconds one `bootstrap` attempt reserves. Long enough that a burst collapses
+/// to a single management call, short enough that an operator whose first attempt
+/// failed (a key name the subnet does not provision) is not locked out.
+const BOOTSTRAP_WINDOW_SECS: u64 = 30;
+
+/// Unix seconds for the `bootstrap` window. Local rather than `now_secs`, whose
+/// unit differs between games.
+fn bootstrap_now() -> u64 {
+    ic_cdk::api::time() / 1_000_000_000
+}
+
+/// Take the `bootstrap` window at `now`, or refuse because a recent attempt still
+/// holds it. Taken only by the update; the boundary only reads it.
+fn claim_bootstrap_window(now: u64) -> bool {
+    LAST_BOOTSTRAP.with(|t| {
+        if !bootstrap_window_free(t.get(), now) {
+            return false;
+        }
+        t.set(now);
+        true
+    })
+}
+
+/// Whether the window is free — the pure half, shared by the boundary and the
+/// update so the two cannot disagree.
+///
+/// `now < last` resolves to **open**, not shut. IC time is monotone per canister,
+/// so it should not happen; the point is that if the assumption ever fails, this
+/// gate degrades to "allow", the way every other branch here does. A gate that
+/// answers "shut" to a clock it does not understand is the latch this deliberately
+/// is not (see `bootstrap`).
+fn bootstrap_window_free(last: u64, now: u64) -> bool {
+    last == 0 || now < last || now.saturating_sub(last) >= BOOTSTRAP_WINDOW_SECS
+}
+
 ic_cdk::export_candid!();
+
+#[cfg(test)]
+mod bootstrap_window_tests {
+    use super::*;
+
+    /// The `bootstrap` window, tested on its pure half — the property that matters
+    /// is that it **reopens**. A latch here would also pass "a burst is refused"
+    /// and then brick the canister on a trapped callback (see `bootstrap`), so the
+    /// reopening case is the one carrying the design, not the refusal.
+    #[test]
+    fn the_bootstrap_window_refuses_a_burst_and_reopens() {
+        assert!(bootstrap_window_free(0, 0));
+        assert!(bootstrap_window_free(0, 1_700_000_000));
+
+        let t = 1_700_000_000;
+        assert!(claim_bootstrap_window(t), "the first attempt takes the window");
+        assert!(!claim_bootstrap_window(t), "a sibling in the same round is refused");
+        assert!(
+            !claim_bootstrap_window(t + BOOTSTRAP_WINDOW_SECS - 1),
+            "still held one second before the window closes"
+        );
+        assert!(
+            claim_bootstrap_window(t + BOOTSTRAP_WINDOW_SECS),
+            "and it reopens on its own — nothing has to release it"
+        );
+        assert!(bootstrap_window_free(t + 100, t), "a backwards clock opens it");
+    }
+}
+

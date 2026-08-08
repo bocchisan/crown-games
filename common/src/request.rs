@@ -19,6 +19,19 @@
 //! wording is game-specific and lives in each game's `protocol`; the framing,
 //! the auth extraction, and the signature check are the same everywhere and live
 //! here — a single security boundary, not one copy per game.
+//!
+//! **The domain line is checked, and until `P8` it was not.** Every game froze a
+//! versioned domain (`crown:conditional-funding:v1`, …) as the message's first
+//! line and specified it as such — but no verifier ever read it: the line carries
+//! no `": "`, so [`parse_fields`] skips it, and each game's `target_ok` bound only
+//! `canister` + `chain`. The consequence is the reason domain separation exists at
+//! all: authorization was *any* signature over *any* text that happened to contain
+//! the four lines `action:`/`chain:`/`canister:`/`collection:`. A wallet holder
+//! talked into signing an unrelated challenge — a login nonce, a terms blob, some
+//! other dApp's receipt — with those lines buried in it handed over a working
+//! `recipient_cancel` (kills a live collection) or `vote`. Nothing else in the
+//! request said which protocol the signature was for. Binding the first line
+//! costs one comparison and is the cheapest check here, so it runs first.
 
 use crate::wallet::{bs58_array, verify};
 use std::collections::BTreeMap;
@@ -46,10 +59,20 @@ impl Request {
     }
 }
 
-/// Parse a request and verify the wallet signature over its signed portion.
-/// `None` if malformed or the signature does not verify.
-pub fn parse(text: &str) -> Option<Request> {
+/// Parse a request, bind it to `domain`, and verify the wallet signature over its
+/// signed portion. `None` if malformed, if the signed message's first line is not
+/// `domain`, or if the signature does not verify.
+///
+/// `domain` is the game's frozen `protocol::DOMAIN`. It is not a formality: it is
+/// what makes the signature mean *this* protocol and *this* version of it rather
+/// than "some text with the right lines in it" (see the module doc). Checked
+/// before the Ed25519 verify — it is the cheaper of the two, and this parse runs
+/// on the anonymous boundary.
+pub fn parse(text: &str, domain: &str) -> Option<Request> {
     let (signed_msg, auth) = text.split_once(SEP)?;
+    if signed_msg.lines().next()? != domain {
+        return None;
+    }
     let extra = parse_fields(auth);
     let pubkey = bs58_array::<32>(extra.get("pubkey")?)?;
     let signature = bs58_array::<64>(extra.get("signature")?)?;
@@ -88,13 +111,14 @@ mod tests {
         out
     }
 
+    const DOMAIN: &str = "crown:test:v1";
     const MSG: &str = "crown:test:v1\naction: go\nchain: devnet\nscope: abc";
 
     #[test]
     fn a_signed_request_parses_and_verifies() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let text = signed_request(&sk, MSG, &[]);
-        let req = parse(&text).expect("parses");
+        let req = parse(&text, DOMAIN).expect("parses");
         assert_eq!(req.pubkey, sk.verifying_key().to_bytes());
         assert_eq!(req.signed("action"), Some("go"));
         assert_eq!(req.signed("scope"), Some("abc"));
@@ -104,7 +128,7 @@ mod tests {
     fn extras_are_parsed_but_separate_from_signed() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let text = signed_request(&sk, MSG, &[("gross", "1860000"), ("nonce", "9")]);
-        let req = parse(&text).expect("parses");
+        let req = parse(&text, DOMAIN).expect("parses");
         assert_eq!(req.extra("gross"), Some("1860000")); // unsigned
         assert_eq!(req.extra("nonce"), Some("9"));
         assert_eq!(req.signed("gross"), None, "extras are not signed fields");
@@ -115,7 +139,7 @@ mod tests {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let mut text = signed_request(&sk, MSG, &[]);
         text = text.replace("action: go", "action: stop"); // signature no longer matches
-        assert!(parse(&text).is_none());
+        assert!(parse(&text, DOMAIN).is_none());
     }
 
     #[test]
@@ -126,14 +150,53 @@ mod tests {
         let sig = bs58::encode(sk.sign(MSG.as_bytes()).to_bytes()).into_string();
         let pk = bs58::encode(other.verifying_key().to_bytes()).into_string();
         let text = format!("{MSG}{SEP}pubkey: {pk}\nsignature: {sig}");
-        assert!(parse(&text).is_none());
+        assert!(parse(&text, DOMAIN).is_none());
     }
 
     #[test]
     fn a_missing_separator_or_auth_is_rejected() {
-        assert!(parse("no separator here").is_none());
+        assert!(parse("no separator here", DOMAIN).is_none());
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let pk = bs58::encode(sk.verifying_key().to_bytes()).into_string();
-        assert!(parse(&format!("{MSG}{SEP}pubkey: {pk}")).is_none()); // missing signature
+        assert!(parse(&format!("{MSG}{SEP}pubkey: {pk}"), DOMAIN).is_none()); // missing signature
+    }
+
+    /// The check the domain line exists for. A **genuine** signature — right key,
+    /// right bytes — over text that is not this protocol's message must not
+    /// authorize anything, however many of the right `key: value` lines it holds.
+    ///
+    /// This is the phishing shape, not a hypothetical: the fields below are
+    /// exactly what a game's `admit_*` reads, so before the domain was bound, a
+    /// wallet talked into signing the "login challenge" below produced a valid
+    /// `cancel`/`vote` for a live scope.
+    #[test]
+    fn a_signature_over_foreign_text_authorizes_nothing() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let phish = "Sign in to Example\n\
+                     Terms: https://example.invalid/tos\n\
+                     action: go\n\
+                     chain: devnet\n\
+                     scope: abc\n\
+                     Nonce: 8842";
+        let text = signed_request(&sk, phish, &[]);
+        // The signature itself is valid — that is the point.
+        let sig: [u8; 64] = sk.sign(phish.as_bytes()).to_bytes();
+        assert!(verify(phish, &sk.verifying_key().to_bytes(), &sig));
+        assert!(
+            parse(&text, DOMAIN).is_none(),
+            "a signature over text that is not this protocol's message must not parse"
+        );
+    }
+
+    /// A different game's (or a later version's) message is refused too — one
+    /// domain, one protocol. The `canister` field already separates the games that
+    /// exist today; the domain is what keeps that true when a message gains a
+    /// field, a game is redeployed, or a fourth game reuses the framing.
+    #[test]
+    fn another_domain_is_refused() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let other = MSG.replace("crown:test:v1", "crown:test:v2");
+        assert!(parse(&signed_request(&sk, &other, &[]), DOMAIN).is_none());
+        assert!(parse(&signed_request(&sk, MSG, &[]), "crown:test:v2").is_none());
     }
 }

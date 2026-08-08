@@ -45,6 +45,14 @@ const SEP: &str = "\n---\n";
 const DEADLINE_MARGIN: i64 = 259_200;
 /// `conditional_tasks_logic::MIN_VOTE_WEIGHT` — a lighter vote never counts.
 const MIN_VOTE_WEIGHT: u128 = 100_000;
+/// `config::MIN_GROSS` of the **testnet** profile — the game floor a registration
+/// must clear. Copied like `VOTING_PERIOD` above (config is baked into the wasm,
+/// not visible to this test binary), so it has to be re-copied whenever
+/// `config/testnet.toml` moves: the sub-floor case below is `MIN_GROSS - 1`, and
+/// a stale value here stops being sub-floor and the test fails on the *right*
+/// behaviour. Mainnet's floor is `2_200_000` and is deliberately not this number
+/// (`cost.md §6`: devnet floors are dropped so a live run costs cents).
+const MIN_GROSS: u64 = 250_000;
 
 fn b58_32(s: &str) -> [u8; 32] {
     bs58::decode(s).into_vec().unwrap().try_into().unwrap()
@@ -202,6 +210,38 @@ struct CompiledInstruction {
 struct LoadedAddresses {
     writable: Vec<String>,
     readonly: Vec<String>,
+}
+
+/// Non-negativity, **measured rather than promised** (`cost.md §6`,
+/// `01-standards §Тесты 4,12`). A paid pull must leave the canister no poorer than
+/// it found it: it takes `price` in and spends execution (plus, for the signature,
+/// the threshold fee the management canister charges *us*). So the balance delta
+/// across the call has to be >= 0, and what is left of `price` is the margin.
+///
+/// Until this existed, "`SIGN_PRICE` >= measured `sign_with_schnorr`" and
+/// "`ROOT_PRICE` >= two BLS pairings" were sentences in `cost.md` with nothing
+/// executing them: both are baked constants, and a config edit that dropped either
+/// below cost would have gone green all the way to mainnet, where the symptom is a
+/// slow cycle leak rather than a failure.
+///
+/// **What it is not:** a mainnet number. PocketIC runs a 13-node application
+/// subnet; the games live on a 34-node fiduciary one, where execution and the
+/// threshold signature cost roughly 2.6x more. So this is a floor — it catches a
+/// price set below even the cheap subnet's cost. The mainnet figure stays a
+/// cost-gate measurement (`07-build-plan §P8`), and the margin printed here is
+/// what that gate compares against.
+fn assert_price_covers_the_work(what: &str, before: u128, after: u128, price: u128) {
+    let spent = price.saturating_sub(after.saturating_sub(before));
+    println!(
+        "[cost] {what}: charged {price}, spent {spent}, margin {} cycles",
+        price.saturating_sub(spent)
+    );
+    assert!(
+        after >= before,
+        "{what} charged {price} cycles and left the canister {} poorer — the price \
+         no longer covers the work it triggers (spent ~{spent})",
+        before.saturating_sub(after)
+    );
 }
 
 fn build(dir: &str, extra: &[&str]) {
@@ -720,6 +760,142 @@ fn register_decline_and_sign_a_real_verdict() {
         .expect("get_task");
     assert!(Decode!(&tq, Option<TaskStateView>).unwrap().is_some());
 
+    // ---- the clock-free half of the registration policy lives at the boundary ----
+    //
+    // A registration below the game floor is doomed **permanently**: `gross` is
+    // committed by `task_id` against an escrow that cannot change, and no passage
+    // of time turns the refusal into an acceptance. Until `P8` the floor was
+    // checked only in the update, so such a call was *admitted* — it came back
+    // `GrossBelowFloor` after a full replicated execution — and it never
+    // materialized, so `is_materialized` never began to refuse it either. With no
+    // nonce in the signed half of a request, that one message was a flood
+    // template: free to replay, billed to this canister, forever.
+    //
+    // This is the only shape that can tell the fix from its absence, which is why
+    // it costs a second birth: the request must carry a **valid** proof and still
+    // be doomed. Anything cheaper (a bad witness, no cached root) is dropped by a
+    // check that was already there.
+    let low_gross = MIN_GROSS - 1;
+    let low_nonce = 2u64;
+    let low_id = protocol::task_id(
+        tasks.as_slice(),
+        donor_pk,
+        recipient,
+        low_gross,
+        deadline,
+        FEE_BPS,
+        fee_wallet(),
+        low_nonce,
+        duration,
+        VOTING_PERIOD,
+    );
+    let low_bs58 = bs58::encode(low_id).into_string();
+    let rq = pic
+        .query_call(tasks, anon(), "get_resolver", Encode!(&low_bs58).unwrap())
+        .expect("get_resolver");
+    let low_resolver: [u8; 32] =
+        bs58::decode(Decode!(&rq, Option<String>).unwrap().expect("resolver"))
+            .into_vec()
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let low_salt = crown_salt::two_outcome::two_outcome(
+        donor_pk,
+        recipient,
+        low_gross,
+        deadline,
+        low_resolver,
+        FEE_BPS,
+        fee_wallet(),
+        low_nonce,
+    );
+    let (low_escrow, _) =
+        crown_derive::solana_pda_address(factory(), &[b"escrow", &low_salt]).unwrap();
+    let reply = consistent_reply(
+        birth_tx(
+            Pubkey::new_from_array(donor_pk),
+            Pubkey::new_from_array(low_escrow),
+            low_salt,
+        ),
+        556,
+    );
+    pic.update_call(
+        mock,
+        anon(),
+        "set_reply",
+        Encode!(&Encode!(&reply).unwrap()).unwrap(),
+    )
+    .expect("set_reply");
+    let ir = relay(
+        &pic,
+        proxy,
+        index,
+        "ingest",
+        Encode!(&"sig-reg-low".to_string()).unwrap(),
+        INGEST_PRICE,
+    );
+    assert!(matches!(
+        Decode!(&ir, IngestResult).unwrap(),
+        IngestResult::Applied { births: 1, .. }
+    ));
+    // The root moved with that ingest, so the witness below needs it cached too.
+    let cq = pic
+        .query_call(index, anon(), "get_certificate", Encode!().unwrap())
+        .expect("get_certificate");
+    let low_cert = Decode!(&cq, Option<Vec<u8>>, Vec<u8>)
+        .unwrap()
+        .0
+        .expect("certificate present");
+    let pr = relay(
+        &pic,
+        proxy,
+        tasks,
+        "push_root",
+        Encode!(&low_cert).unwrap(),
+        1_000_000_000u128,
+    );
+    assert!(matches!(
+        Decode!(&pr, TaskResult).unwrap(),
+        TaskResult::RootPushed
+    ));
+    let bq = pic
+        .query_call(
+            index,
+            anon(),
+            "get_birth",
+            Encode!(&low_escrow.to_vec()).unwrap(),
+        )
+        .expect("get_birth");
+    let low_witness = Decode!(&bq, Option<BirthView>, Vec<u8>).unwrap().1;
+
+    let low_msg = protocol::register_message(
+        "devnet",
+        &tasks.to_text(),
+        &low_bs58,
+        &hex::encode(text_hash),
+        duration,
+    );
+    let low_text = signed_request(
+        &donor,
+        &low_msg,
+        &[
+            ("recipient", bs58::encode(recipient).into_string()),
+            ("gross", low_gross.to_string()),
+            ("deadline", deadline.to_string()),
+            ("nonce", low_nonce.to_string()),
+            ("witness", hex::encode(&low_witness)),
+        ],
+    );
+    assert!(
+        pic.update_call(tasks, anon(), "register_task", Encode!(&low_text).unwrap())
+            .is_err(),
+        "a sub-floor registration with a valid birth proof must die at the \
+         boundary, not be executed and answered `GrossBelowFloor`"
+    );
+    // …and the same request one unit above the floor is a different story: the
+    // boundary has no quarrel with it. (Proven by the successful register above,
+    // which is exactly this request at `gross = 2_000_000`.)
+
     // Recipient declines → the task is Decided{Cancel}.
     let decline_msg = protocol::decline_message("devnet", &tasks.to_text(), &task_bs58);
     let decline_text = signed_request(&recipient_sk, &decline_msg, &[]);
@@ -763,6 +939,8 @@ fn register_decline_and_sign_a_real_verdict() {
     let mut verdict = b"crown:two-outcome:devnet".to_vec();
     verdict.extend_from_slice(&factory()); // program_id == crate::ID == config::FACTORY
     verdict.push(1u8); // cancel
+    verdict.extend_from_slice(&FEE_BPS.to_le_bytes());
+    verdict.extend_from_slice(&fee_wallet());
     let vk = ed25519_dalek::VerifyingKey::from_bytes(&resolver)
         .expect("resolver is a valid Ed25519 public key");
     let sig = ed25519_dalek::Signature::from_slice(&signature).expect("64-byte signature");
@@ -970,6 +1148,7 @@ fn a_weighted_vote_decides_both_verdicts_and_signs_them() {
         .unwrap()
         .0
         .expect("certificate present");
+    let before_root = pic.cycle_balance(tasks);
     let pr = relay(
         &pic,
         proxy,
@@ -981,6 +1160,12 @@ fn a_weighted_vote_decides_both_verdicts_and_signs_them() {
     assert!(
         matches!(Decode!(&pr, TaskResult).unwrap(), TaskResult::RootPushed),
         "the index certificate authenticates a root"
+    );
+    assert_price_covers_the_work(
+        "push_root",
+        before_root,
+        pic.cycle_balance(tasks),
+        1_000_000_000,
     );
 
     // ---- register → accept → ready → vote, both tasks, direct ingress ----
@@ -1148,6 +1333,7 @@ fn a_weighted_vote_decides_both_verdicts_and_signs_them() {
         );
 
         // Paid pull → a real threshold Ed25519 signature over this task's verdict.
+        let before_sign = pic.cycle_balance(tasks);
         let sr = relay(
             &pic,
             proxy,
@@ -1163,6 +1349,12 @@ fn a_weighted_vote_decides_both_verdicts_and_signs_them() {
             } => {
                 assert_eq!(got_outcome, *outcome, "task {nonce}: signed outcome");
                 assert_eq!(signature.len(), 64, "a 64-byte Ed25519 signature");
+                assert_price_covers_the_work(
+                    "request_signature",
+                    before_sign,
+                    pic.cycle_balance(tasks),
+                    26_200_000_000,
+                );
                 signature
             }
             other => panic!("task {nonce}: expected Signed, got {other:?}"),
@@ -1174,6 +1366,8 @@ fn a_weighted_vote_decides_both_verdicts_and_signs_them() {
         let mut verdict = b"crown:two-outcome:devnet".to_vec();
         verdict.extend_from_slice(&factory());
         verdict.push(*outcome);
+        verdict.extend_from_slice(&FEE_BPS.to_le_bytes());
+        verdict.extend_from_slice(&fee_wallet());
         let vk = ed25519_dalek::VerifyingKey::from_bytes(resolver)
             .expect("resolver is a valid Ed25519 public key");
         let sig = ed25519_dalek::Signature::from_slice(&signature).expect("64-byte signature");
