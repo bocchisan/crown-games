@@ -138,6 +138,46 @@ jobs:
           candid-extractor "target/wasm32-unknown-unknown/release/$crate.wasm" > /tmp/gen.did
           diff -u '${{ matrix.game }}.did' /tmp/gen.did
 
+  # `direct-settlement` — прямой донат с комиссией: ни канистры, ни резолвера, ни
+  # своей ончейн-программы (только форма транзакции + политика подающего). Своё
+  # у него одно — арифметика разбиения и флоров в zero-dep `logic/`, поэтому
+  # fmt/clippy/test гоняются по ней, а `.did` и pocket-ic не нужны вовсе.
+  direct-settlement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: crown-games
+
+      - name: fmt
+        working-directory: crown-games/direct-settlement
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        working-directory: crown-games/direct-settlement
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        working-directory: crown-games/direct-settlement
+        run: cargo test
+
+      # «Канистры нет» — свойство, которое обязано проверяться, а не обещаться:
+      # заведи её кто-нибудь позже, и весь разбор не-отрицательности этой игры
+      # (`docs/spec.md §Не-отрицательность`) молча перестанет быть верным — там
+      # он держится на том, что чужой ввод не попадает ни в один наш процесс.
+      - name: no canister, no resolver, no on-chain program of its own
+        working-directory: crown-games/direct-settlement
+        run: |
+          ! grep -rnwE 'ic_cdk|sign_with_schnorr|resolver|declare_id' --include='*.rs' . 2>/dev/null
+          ! ls ./*.did 2>/dev/null
+
+      # `logic/` — zero-dep по контракту харнесса: у него нет и не должно быть
+      # зависимостей сверх dev-only `proptest`.
+      - name: logic is zero-dep
+        working-directory: crown-games/direct-settlement/logic
+        run: |
+          ! grep -A 99 '^\[dependencies\]' Cargo.toml | sed -n '2,/^\[/p' | grep -qE '^[a-z]'
+
   # `subscription` — использование формы `stream` БЕЗ канистры и резолвера: в
   # каталоге только `docs/` и офчейн-`e2e/`, поэтому у него нет ни fmt/clippy/test
   # игры, ни `.did`. Проверяется ровно то, что делает его тем, чем он является.

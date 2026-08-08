@@ -623,8 +623,7 @@ fn admit_register(text: &str) -> Result<Registered, TaskResult> {
     // already-authenticated index root (`push_root` did the BLS, paid). A pure
     // hash-tree walk, O(log n) — it fits the `inspect_message` budget, which the
     // certificate's pairings do not (`push_root`).
-    let Some(b) = ROOTS.with_borrow(|cache| roots::birth(cache, &witness, &address))
-    else {
+    let Some(b) = ROOTS.with_borrow(|cache| roots::birth(cache, &witness, &address)) else {
         return Err(TaskResult::BadBirthProof);
     };
     // `gross` is committed via the escrow address (an input to `escrow_address`
@@ -833,8 +832,14 @@ mod bootstrap_window_tests {
         assert!(bootstrap_window_free(0, 1_700_000_000));
 
         let t = 1_700_000_000;
-        assert!(claim_bootstrap_window(t), "the first attempt takes the window");
-        assert!(!claim_bootstrap_window(t), "a sibling in the same round is refused");
+        assert!(
+            claim_bootstrap_window(t),
+            "the first attempt takes the window"
+        );
+        assert!(
+            !claim_bootstrap_window(t),
+            "a sibling in the same round is refused"
+        );
         assert!(
             !claim_bootstrap_window(t + BOOTSTRAP_WINDOW_SECS - 1),
             "still held one second before the window closes"
@@ -843,7 +848,9 @@ mod bootstrap_window_tests {
             claim_bootstrap_window(t + BOOTSTRAP_WINDOW_SECS),
             "and it reopens on its own — nothing has to release it"
         );
-        assert!(bootstrap_window_free(t + 100, t), "a backwards clock opens it");
+        assert!(
+            bootstrap_window_free(t + 100, t),
+            "a backwards clock opens it"
+        );
     }
 }
-

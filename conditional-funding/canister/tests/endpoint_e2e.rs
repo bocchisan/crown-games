@@ -279,9 +279,7 @@ fn queries_wire_through() {
             Encode!(&unknown_collection()).unwrap(),
         )
         .expect("get_collection");
-    assert!(
-        Decode!(&g, Option<conditional_funding::CollectionView>)
-            .unwrap()
-            .is_none()
-    );
+    assert!(Decode!(&g, Option<conditional_funding::CollectionView>)
+        .unwrap()
+        .is_none());
 }

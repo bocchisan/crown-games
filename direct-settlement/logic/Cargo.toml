@@ -1,0 +1,10 @@
+[package]
+name = "direct-settlement-logic"
+version = "0.1.0"
+edition = "2021"
+description = "direct-settlement: разбиение суммы на комиссию/остаток и два флора (zero-dep)"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"

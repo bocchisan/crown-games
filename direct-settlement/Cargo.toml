@@ -1,0 +1,5 @@
+# direct-settlement — воркспейс: только logic (zero-dep). Канистры нет и не будет:
+# игра целиком — сборка транзакции клиентом плюс политика подающего (docs/spec.md).
+[workspace]
+members = ["logic"]
+resolver = "2"

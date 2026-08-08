@@ -579,7 +579,12 @@ fn register_cancel_and_sign_a_real_verdict() {
         ),
         "the index certificate authenticates a root"
     );
-    assert_price_covers_the_work("push_root", before_root, pic.cycle_balance(game), ROOT_PRICE);
+    assert_price_covers_the_work(
+        "push_root",
+        before_root,
+        pic.cycle_balance(game),
+        ROOT_PRICE,
+    );
 
     // Register as a **direct ingress** — what a real donor wallet sends. This is
     // the boundary contract: with the certificate's BLS moved to `push_root`, the

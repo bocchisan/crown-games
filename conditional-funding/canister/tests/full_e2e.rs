@@ -98,7 +98,10 @@ fn game_wasm() -> Vec<u8> {
 /// gate should be comparing against.
 fn assert_price_covers_the_work(what: &str, before: u128, after: u128, price: u128) {
     let spent = price.saturating_sub(after.saturating_sub(before));
-    println!("[cost] {what}: charged {price}, spent {spent}, margin {} cycles", price.saturating_sub(spent));
+    println!(
+        "[cost] {what}: charged {price}, spent {spent}, margin {} cycles",
+        price.saturating_sub(spent)
+    );
     assert!(
         after >= before,
         "{what} charged {price} cycles and left the canister {} poorer — the price \
@@ -714,7 +717,10 @@ fn create_cancel_and_sign_a_real_verdict() {
     // because this is the *only* place it is published: `collection_id` is a hash,
     // and every contribution after the one that materialized the collection joins
     // by deriving the resolver, never presenting itself here (spec §Тайминги).
-    assert_eq!(view.created_at, created_at, "the birth slot, through the anchor");
+    assert_eq!(
+        view.created_at, created_at,
+        "the birth slot, through the anchor"
+    );
     assert_eq!(view.duration, duration);
     assert_eq!(view.voting_period, VOTING_PERIOD);
     assert_eq!(

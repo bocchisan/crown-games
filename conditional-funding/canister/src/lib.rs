@@ -865,8 +865,14 @@ mod tests {
         assert!(bootstrap_window_free(0, 1_700_000_000));
 
         let t = 1_700_000_000;
-        assert!(claim_bootstrap_window(t), "the first attempt takes the window");
-        assert!(!claim_bootstrap_window(t), "a sibling in the same round is refused");
+        assert!(
+            claim_bootstrap_window(t),
+            "the first attempt takes the window"
+        );
+        assert!(
+            !claim_bootstrap_window(t),
+            "a sibling in the same round is refused"
+        );
         assert!(
             !claim_bootstrap_window(t + BOOTSTRAP_WINDOW_SECS - 1),
             "still held one second before the window closes"
