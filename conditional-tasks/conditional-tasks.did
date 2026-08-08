@@ -64,6 +64,7 @@ service : (opt InitArgs) -> {
   decline : (text) -> (TaskResult);
   get_logic_version : () -> (nat32) query;
   get_resolver : (text) -> (opt text) query;
+  get_sign_price : () -> (nat) query;
   // The verdict signature already produced for a scope, if any. Free query — a
   // claimer that lost the race, or one that simply needs the bytes again, reads
   // them here instead of paying the relay to re-request a `SIGN_PRICE` pull.

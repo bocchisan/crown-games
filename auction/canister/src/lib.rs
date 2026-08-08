@@ -465,7 +465,12 @@ async fn request_signature(
     {
         return AuctionResult::Signed { outcome, signature };
     }
-    if ic_cdk::api::msg_cycles_available() < config::SIGN_PRICE {
+    // The price the network charges today, not the one baked last build
+    // (`sign_price`). Identical while the constant is the larger of the two,
+    // which it is — this refuses only in the case where the old code would have
+    // signed at a loss instead.
+    let price = sign_price();
+    if ic_cdk::api::msg_cycles_available() < price {
         return AuctionResult::Underpaid;
     }
     let now = now_secs();
@@ -509,7 +514,7 @@ async fn request_signature(
         return AuctionResult::SignInFlight;
     }
     // Payment accepted only now, before the (paid) threshold signature.
-    ic_cdk::api::msg_cycles_accept(config::SIGN_PRICE);
+    ic_cdk::api::msg_cycles_accept(price);
     let arg = SignWithSchnorrArgs {
         // The consumer's own price list rides in the signed message, so the
         // signature cannot open an escrow that joined this scope by deriving the
@@ -984,6 +989,28 @@ fn claim_bootstrap_window(now: u64) -> bool {
 /// is not (see `bootstrap`).
 fn bootstrap_window_free(last: u64, now: u64) -> bool {
     last == 0 || now < last || now.saturating_sub(last) >= BOOTSTRAP_WINDOW_SECS
+}
+
+/// What one verdict signature costs right now — the baked `SIGN_PRICE` or the
+/// price the IC quotes for this key, whichever is larger. Policy and the reason
+/// for it live in `crown_games_common::signing::sign_price`; the three lines of
+/// CDK stay here, as with `now_secs`.
+///
+/// Exposed as a free `query` on purpose: it is the number the relay's own
+/// `sign_price` has to stay at or above, and a value only readable by triggering
+/// a refusal is a value nobody watches. Monitoring compares the two and sees the
+/// day they cross **before** a settlement does.
+fn sign_price() -> u128 {
+    signing::sign_price(
+        config::SIGN_PRICE,
+        // 1 = `SchnorrAlgorithm::Ed25519 as u32`.
+        ic_cdk::api::cost_sign_with_schnorr(config::THRESHOLD_KEY, 1).ok(),
+    )
+}
+
+#[ic_cdk::query]
+fn get_sign_price() -> u128 {
+    sign_price()
 }
 
 ic_cdk::export_candid!();

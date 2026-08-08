@@ -109,6 +109,7 @@ service : (opt InitArgs) -> {
   get_collection : (text) -> (opt CollectionView) query;
   get_logic_version : () -> (nat32) query;
   get_resolver : (text) -> (opt text) query;
+  get_sign_price : () -> (nat) query;
   // The verdict signature already produced for a collection, if any. Free query —
   // every escrow after the first reads the bytes here instead of paying the relay
   // to re-request a `SIGN_PRICE` pull for a signature that already exists.

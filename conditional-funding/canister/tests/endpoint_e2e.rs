@@ -41,10 +41,14 @@ fn build(dir: &str, extra: &[&str]) {
     assert!(status.success(), "failed to build {dir}");
 }
 
+/// Always built, never skipped on "the file is already there" — the same guard
+/// `full_e2e` documents, and for the same reason plus one. These bytes depend on
+/// `config/`, so a cached artifact silently disagrees with the ids the test
+/// derives; and a cached artifact from *before* a method existed answers
+/// `CanisterMethodNotFound`, which reads like a missing export rather than a
+/// stale build. Cargo no-ops when nothing changed, so the guard costs nothing.
 fn game_wasm() -> Vec<u8> {
-    if !std::path::Path::new(WASM).exists() {
-        build(".", &["-p", "conditional-funding"]);
-    }
+    build(".", &["-p", "conditional-funding"]);
     std::fs::read(WASM).expect("read conditional-funding wasm")
 }
 
@@ -255,6 +259,33 @@ fn an_unknown_method_is_not_admissible() {
         Encode!(&"anything".to_string()).unwrap(),
     );
     assert!(res.is_err(), "an unknown method must never be admitted");
+}
+
+/// `get_sign_price` is the number the relay's own config has to stay at or above,
+/// and it is a **query** so monitoring can watch the two converge instead of
+/// finding out from a refused settlement. Today the baked price is the larger of
+/// the two, so this must equal it exactly — the assertion doubles as proof that
+/// nothing changed for the paying path when the price stopped being a constant.
+#[test]
+fn the_sign_price_is_readable_and_is_todays_baked_price() {
+    let (pic, game, _proxy) = setup();
+    let p = pic
+        .query_call(
+            game,
+            Principal::anonymous(),
+            "get_sign_price",
+            Encode!().unwrap(),
+        )
+        .expect("get_sign_price");
+    let quoted = Decode!(&p, u128).unwrap();
+    assert!(
+        quoted >= SIGN_PRICE,
+        "the charged price may only ever rise above the baked one, got {quoted}"
+    );
+    assert_eq!(
+        quoted, SIGN_PRICE,
+        "the network still quotes under the baked price, so the paying path is unchanged"
+    );
 }
 
 #[test]

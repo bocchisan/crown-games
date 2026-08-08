@@ -89,6 +89,7 @@ service : (opt InitArgs) -> {
   // ignored them would be shared by every escrow a donor funds under one nonce.
   // The donor already knows both — they are the escrow they are about to create.
   get_resolver : (text, text, nat64, nat64, int64) -> (opt text) query;
+  get_sign_price : () -> (nat) query;
   // The verdict signature already produced for an entry, if any. Free query — a
   // claimer that lost the race, or one that simply needs the bytes again, reads
   // them here instead of paying the relay to re-request a `SIGN_PRICE` pull.

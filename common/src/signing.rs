@@ -73,6 +73,43 @@ pub fn reset_for_test() {
     IN_FLIGHT.with_borrow_mut(BTreeSet::clear);
 }
 
+/// What one verdict signature must cost, given the price the IC quotes for it.
+///
+/// **Why ask instead of trusting the constant.** `SIGN_PRICE` is baked at build
+/// time from `config/`; the real price is set by the network and moves with NNS
+/// decisions and with the size of the subnet a game lands on. While the constant
+/// is the larger of the two nothing changes — but the day the network's price
+/// passes it, a game still charging the constant signs at a loss on every call,
+/// and the only symptom is a falling cycle balance. The IC publishes the number
+/// (`ic0.cost_sign_with_schnorr`), so guessing it is a choice, not a constraint.
+///
+/// **Why `max` and not the quote alone.** The baked price is what the relay's own
+/// config is aligned against (`cost.md §1`); following a cheaper quote downward
+/// would undercut that alignment silently. The floor only rises here.
+///
+/// **Why this cannot brick settlement.** It demands nothing more than the relay
+/// attaches today: the current quote is below the baked price, so the answer *is*
+/// the baked price and behaviour is unchanged bit for bit. If a quote ever exceeds
+/// it, `request_signature` answers `Underpaid` rather than signing at a loss — an
+/// outage that is loud and fixed by raising two config lines (neither the games
+/// nor the relay are frozen), instead of a leak that is silent and fixed by
+/// nothing. Escrows are untouched either way: they refund at their deadline
+/// without any signature.
+///
+/// `None` — the system refused to quote (an unknown key name) — falls back to the
+/// baked price. That is the pre-existing behaviour and the safe direction: it can
+/// only under-charge by what the constant was already willing to under-charge.
+///
+/// The CDK call that produces `quoted` stays in the games: this crate has no
+/// dependency on `ic-cdk` and no business acquiring one for three lines (the same
+/// division as `now_secs`, `field`).
+pub fn sign_price(baked: u128, quoted: Option<u128>) -> u128 {
+    match quoted {
+        Some(q) => baked.max(q),
+        None => baked,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +145,20 @@ mod tests {
         release(&scope); // sign_with_schnorr rejected
         assert!(cached(&scope).is_none(), "nothing was produced");
         assert!(claim(scope), "the next caller may try again");
+    }
+
+    /// The floor only rises, and an unquotable key is not a discount.
+    #[test]
+    fn the_sign_price_is_a_floor_that_only_rises() {
+        const BAKED: u128 = 35_800_000_000;
+        // Today's shape: the network quotes less than the constant → unchanged.
+        assert_eq!(sign_price(BAKED, Some(26_153_846_153)), BAKED);
+        // The day it passes the constant, the constant stops being the answer.
+        assert_eq!(sign_price(BAKED, Some(40_000_000_000)), 40_000_000_000);
+        // Equal is not a special case.
+        assert_eq!(sign_price(BAKED, Some(BAKED)), BAKED);
+        // No quote → the baked price, i.e. exactly what shipped before this existed.
+        assert_eq!(sign_price(BAKED, None), BAKED);
     }
 
     #[test]

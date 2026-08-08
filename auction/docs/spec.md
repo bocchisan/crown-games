@@ -224,7 +224,8 @@
 **Update:** `register_entry` · `accept_lot` · `return_lot` · `return_entry` · `cancel_auction` ·
 `request_signature(chain, auction, lot, escrow)` · **`push_root`**.
 **Query:** `get_auction` · `get_lot` · `get_resolver` · `get_signature(auction, lot, escrow)` ·
-`get_logic_version`. **Инфра:** `init(opt InitArgs)` / `bootstrap()`.
+`get_logic_version` · `get_sign_price` (цена подписи сейчас — см. `conditional-tasks/docs/spec.md`).
+**Инфра:** `init(opt InitArgs)` / `bootstrap()`.
 
 `create_auction`/`get_auction_id` в списке нет — `auction_id` выводит клиент (§Таблица переходов).
 `pick_winner`, `ready` и `vote` **удалены**: победителя даёт закрытие, стадии выполнения нет, голоса нет.
