@@ -85,9 +85,59 @@ const _: () = assert!(
      under-sizing it drops valid registrations at the boundary, invisibly"
 );
 
+// ---- The vote cap, derived from the margin rather than picked ----
+//
+// A vote is the one path in the system with no fee behind it (`cost.md §4`), so
+// what bounds the loss is a cap, and what the cap has to fit inside is the margin
+// the floor leaves over break-even. `500` was a round number chosen while `v` was
+// an *estimate* of 15e6 cycles. The estimate was low.
+
+/// Measured price of one vote, in cycles, on a 34-node fiduciary subnet — the
+/// kind of subnet the games actually run on.
+///
+/// Measured at `P8` on a 13-node application subnet (10 536 024 cycles, printed
+/// by `conditional-funding`'s `full_e2e`) and scaled by 34/13, the IC's own linear
+/// scaling in subnet size. **1.84× the 15e6 the model assumed**, which is the
+/// whole reason the cap below moved.
+pub const VOTE_COST_CYCLES: u128 = 27_555_755;
+
+/// The protocol peg, in USDC minor units per 1e12 cycles: `1e12 cycles = 1 XDR
+/// = $1.36643` (`cost.md`).
+const PEG_MINOR_PER_TERA: u128 = 1_366_430;
+
+/// The reference scope, in USDC minor units — `conditional-tasks` at `V = 0`
+/// (`B = 1`, nothing amortizes), which `cost.md §3` uses as the reference and
+/// `conditional-funding` matches exactly at `N = 1`.
+const REFERENCE_COST: u128 = 54_980; // 2g + s = $0.05498
+const REFERENCE_FLOOR: u128 = 2_200_000; // MIN_GROSS = $2.20
+const REFERENCE_FEE_BPS: u128 = 300;
+
 /// Cap of votes per scope (non-negativity invariant #7; `cost.md §6` `V_MAX`) —
-/// the ceiling on what an unprofitable scope can cost in vote traffic.
-pub const V_MAX: usize = 500;
+/// the ceiling on what a scope with no room left can cost in vote traffic.
+///
+/// **Derived, not picked.** A scope at the floor earns `f·MIN_GROSS` and spends
+/// `2g + s` before a single vote is cast; what is left is the margin, and this cap
+/// is how many votes fit inside it. At the measured price that is 292, so the cap
+/// is 250 — the next round number below, leaving ~15% of the margin intact even
+/// when a scope is voted to the ceiling.
+///
+/// At the old `500` a fully-voted scope at the floor **lost** roughly $0.008: the
+/// margin covers 292 votes and 500 were allowed. Lowering the cap rather than
+/// raising the floor is the project's own recorded preference (`cost.md §6.1` —
+/// the cap "enters the cost of an attack linearly and the usefulness of voting
+/// almost not at all"), and it doubles what filling a game canister's memory with
+/// votes costs, since a capped scope is now half the size.
+pub const V_MAX: usize = 250;
+
+/// The cap must fit in the margin — the law above, as a law rather than a
+/// sentence. Red if the vote gets dearer, the fee is cut, the floor drops or the
+/// cap is raised past what pays for it.
+const _: () = assert!(
+    (V_MAX as u128) * VOTE_COST_CYCLES * PEG_MINOR_PER_TERA / 1_000_000_000_000
+        <= REFERENCE_FLOOR * REFERENCE_FEE_BPS / 10_000 - REFERENCE_COST,
+    "V_MAX votes cost more than the margin a scope at the floor has to spend — \
+     a fully-voted scope would run at a loss (cost.md §4, §6)"
+);
 
 pub fn u64_of(s: Option<&str>) -> Option<u64> {
     s?.parse().ok()

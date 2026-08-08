@@ -1132,6 +1132,12 @@ fn a_quorate_vote_decides_a_collection_both_ways() {
         // The ballot. Its weight is proven, not asserted: a hash-tree walk over the
         // reputation witness against the root pushed above — the same path
         // `inspect_message` ran to admit this very call.
+        // `v` — the price of one vote, the last unmeasured входная цена of the
+        // model (`cost.md §1` carried an estimate of ~15e6). Measured here rather
+        // than assumed: a vote is the only path with no fee behind it, so if it
+        // costs more than the model says, every scope quietly runs at a loss in
+        // proportion to how popular it was.
+        let before_vote = pic.cycle_balance(game);
         let vr = pic
             .update_call(
                 game,
@@ -1147,6 +1153,10 @@ fn a_quorate_vote_decides_a_collection_both_ways() {
             .unwrap_or_else(|e| {
                 panic!("collection {recipient_nonce}: a weight-proven vote must be admitted: {e:?}")
             });
+        println!(
+            "[cost] vote: {} cycles",
+            before_vote.saturating_sub(pic.cycle_balance(game))
+        );
         assert!(
             matches!(
                 Decode!(&vr, CollectionResult).unwrap(),
